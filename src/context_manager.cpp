@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 #include <vector>
 #include <future>
@@ -54,9 +55,13 @@ ContextManager& ContextManager::getInstance() {
  * Private constructor
  */
 ContextManager::ContextManager()
-    : nextContextId(1), totalHashes(0), totalVerifications(0), cacheHits(0), cacheMisses(0) {
+    : nextContextId(1),
+      totalHashes(0),
+      totalHashTimeMicros(0),
+      totalVerifications(0),
+      cacheHits(0),
+      cacheMisses(0) {
 
-    // Initialize hardware optimizations
     optimizeHardware();
 }
 
@@ -90,6 +95,11 @@ void ContextManager::setupHugePages() {
  */
 void ContextManager::optimizeHardware() {
 #ifdef __linux__
+    const char* env = std::getenv("NODE_RANDOMX_OPTIMIZE_HOST");
+    if (!env || std::strcmp(env, "1") != 0) {
+        return;
+    }
+
     // Disable hardware prefetchers for better cache utilization
     system("echo 0 > /sys/devices/system/cpu/cpufreq/boost");
 
@@ -122,7 +132,9 @@ randomx_flags ContextManager::getOptimalFlags(const RandomXConfig& config) {
         flags |= RANDOMX_FLAG_HARD_AES;
     }
 
-    // Enable large pages only for fast mode and when explicitly requested
+    // randomx_get_flags() does NOT include RANDOMX_FLAG_LARGE_PAGES (RandomX upstream design;
+    // see api-example2.cpp: flags = randomx_get_flags(); flags |= RANDOMX_FLAG_LARGE_PAGES).
+    // When set, randomx_alloc_cache/dataset catch failures and return nullptr — no extra build flag needed.
     if (config.enableHugePages && config.mode == RandomXMode::FAST) {
         flags |= RANDOMX_FLAG_LARGE_PAGES;
     }
@@ -154,6 +166,8 @@ uint32_t ContextManager::createContext(const uint8_t* seed, const RandomXConfig&
 
     // Get optimal flags
     randomx_flags flags = getOptimalFlags(config);
+    context->usedLargePages =
+        (static_cast<int>(flags) & static_cast<int>(RANDOMX_FLAG_LARGE_PAGES)) != 0;
 
     // Create cache
     context->cache = randomx_alloc_cache(flags);
@@ -252,16 +266,33 @@ bool ContextManager::releaseContext(uint32_t contextId) {
 /**
  * Get a RandomX context by ID
  */
-RandomXContext* ContextManager::getContext(uint32_t contextId) {
+RandomXContext* ContextManager::getContext(uint32_t contextId, bool updateLastUsed) {
     std::lock_guard<std::mutex> lock(contextsMutex);
     auto it = contexts.find(contextId);
     if (it != contexts.end()) {
-        // Update last used timestamp
-        it->second->lastUsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (updateLastUsed) {
+            it->second->lastUsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
         return it->second.get();
     }
     return nullptr;
+}
+
+bool ContextManager::getContextInfo(
+    uint32_t contextId,
+    bool& outUsedLargePages,
+    bool& outRequestedLargePages,
+    RandomXMode& outMode
+) {
+    RandomXContext* ctx = getContext(contextId, false);
+    if (!ctx) {
+        return false;
+    }
+    outUsedLargePages = ctx->usedLargePages;
+    outRequestedLargePages = ctx->config.enableHugePages;
+    outMode = ctx->config.mode;
+    return true;
 }
 
 /**
@@ -277,16 +308,12 @@ PerformanceStats ContextManager::getStats() const {
     {
         std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(contextsMutex));
         stats.activeContexts = contexts.size();
+    }
 
-        // Calculate average hash time
-        uint64_t totalHashCount = 0;
-        for (const auto& pair : contexts) {
-            totalHashCount += pair.second->hashCount.load();
-        }
-
-        if (totalHashCount > 0) {
-            stats.averageHashTime = static_cast<double>(stats.totalHashes) / totalHashCount;
-        }
+    const uint64_t n = stats.totalHashes;
+    if (n > 0) {
+        stats.averageHashTime =
+            static_cast<double>(totalHashTimeMicros.load()) / static_cast<double>(n) / 1000.0;
     }
 
     return stats;
@@ -298,11 +325,18 @@ PerformanceStats ContextManager::getStats() const {
 HardwareInfo ContextManager::getHardwareInfo() const {
     HardwareInfo info = {};
 
-    // Check RandomX capabilities
     randomx_flags flags = randomx_get_flags();
     info.hasJit = (flags & RANDOMX_FLAG_JIT) != 0;
     info.hasAes = (flags & RANDOMX_FLAG_HARD_AES) != 0;
-    info.hasHugePages = (flags & RANDOMX_FLAG_LARGE_PAGES) != 0;
+    // Not from randomx_get_flags() — that API never sets LARGE_PAGES. This means "RandomX has a
+    // large-page allocation path on this OS" (MAP_HUGETLB / Windows / superpages, etc.).
+#if defined(__OpenBSD__) || defined(__NetBSD__)
+    info.hasHugePages = false;
+#elif defined(_WIN32) || defined(__CYGWIN__) || defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+    info.hasHugePages = true;
+#else
+    info.hasHugePages = false;
+#endif
 
 #ifdef __linux__
     // Get system information
@@ -337,8 +371,9 @@ HardwareInfo ContextManager::getHardwareInfo() const {
 /**
  * Record hash operation for performance tracking
  */
-void ContextManager::recordHash(uint32_t contextId) {
+void ContextManager::recordHash(uint32_t contextId, uint64_t elapsedMicros) {
     totalHashes.fetch_add(1);
+    totalHashTimeMicros.fetch_add(elapsedMicros);
 
     RandomXContext* context = getContext(contextId);
     if (context) {

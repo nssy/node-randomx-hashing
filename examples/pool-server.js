@@ -1,14 +1,22 @@
 /**
- * Example Mining Pool Server using RandomX Share Verifier
- * Demonstrates context management and share verification
+ * Example mining pool server using RandomX share verification
+ * Uses createContextCache (LRU) so multiple seed_hash values can coexist
+ * during fork transitions without unbounded RAM growth.
  */
 
+const os = require('os');
 const randomx = require('../index');
 const crypto = require('crypto');
 
 class MiningPool {
     constructor() {
-        this.contexts = new Map();
+        this.rxCache = randomx.createContextCache({
+            maxContexts: 2,
+            mode: 'fast',
+            threads: Math.max(1, os.cpus().length),
+            enableHugePages: false
+        });
+
         this.shares = [];
         this.stats = {
             validShares: 0,
@@ -32,30 +40,10 @@ class MiningPool {
     }
 
     /**
-     * Get or create RandomX context for given seed
+     * Resolve RandomX context for seed_hash (LRU inside rxCache).
      */
-    getContext(seedHex) {
-        if (!this.contexts.has(seedHex)) {
-            console.log(`Creating new RandomX context for seed: ${seedHex.substring(0, 16)}...`);
-
-            const seed = Buffer.from(seedHex, 'hex');
-            const contextId = randomx.initContext(seed, {
-                enableJit: true,
-                enableAes: true,
-                enableHugePages: true,
-                threads: 1 // Single-threaded for consistent pool behavior
-            });
-
-            this.contexts.set(seedHex, {
-                id: contextId,
-                created: Date.now(),
-                uses: 0
-            });
-
-            console.log(`Context ${contextId} created successfully`);
-        }
-
-        return this.contexts.get(seedHex);
+    getContextId(seedHex) {
+        return this.rxCache.getContextFromHex(seedHex);
     }
 
     /**
@@ -63,26 +51,20 @@ class MiningPool {
      */
     verifyShare(minerAddress, jobId, nonce, seedHex, difficulty) {
         try {
-            // Get context for this seed
-            const context = this.getContext(seedHex);
-            context.uses++;
+            const contextId = this.getContextId(seedHex);
 
-            // Construct share data (simplified example)
             const shareData = Buffer.concat([
                 Buffer.from(jobId, 'hex'),
                 Buffer.from(minerAddress, 'utf8'),
                 Buffer.from(nonce.toString(16).padStart(8, '0'), 'hex')
             ]);
 
-            // Convert difficulty to target
             const target = this.difficultyToTarget(difficulty);
 
-            // Verify the share
             const startTime = Date.now();
-            const result = randomx.verifyShare(context.id, shareData, target);
+            const result = randomx.verifyShare(contextId, shareData, target);
             const verifyTime = Date.now() - startTime;
 
-            // Log the result
             const shareInfo = {
                 miner: minerAddress,
                 jobId: jobId.substring(0, 8),
@@ -104,7 +86,6 @@ class MiningPool {
             }
 
             return shareInfo;
-
         } catch (error) {
             console.error(`Share verification failed: ${error.message}`);
             this.stats.invalidShares++;
@@ -116,12 +97,7 @@ class MiningPool {
         }
     }
 
-    /**
-     * Convert difficulty number to 32-byte target
-     */
     difficultyToTarget(difficulty) {
-        // Simplified difficulty to target conversion
-        // In real pools, this would be more sophisticated
         const target = Buffer.alloc(32, 0xff);
 
         if (difficulty > 1) {
@@ -138,92 +114,46 @@ class MiningPool {
         return target;
     }
 
-    /**
-     * Get pool statistics
-     */
     getStats() {
         const randomxStats = randomx.getStats();
 
         return {
             pool: this.stats,
             randomx: randomxStats,
-            contexts: {
-                total: this.contexts.size,
-                details: Array.from(this.contexts.entries()).map(([seed, ctx]) => ({
-                    seed: seed.substring(0, 16) + '...',
-                    uses: ctx.uses,
-                    age: Date.now() - ctx.created
-                }))
-            }
+            rxCache: this.rxCache.getSnapshot()
         };
     }
 
-    /**
-     * Cleanup old contexts
-     */
-    cleanupContexts(maxAge = 5 * 60 * 1000) { // 5 minutes
-        const now = Date.now();
-        const toRemove = [];
-
-        for (const [seed, context] of this.contexts.entries()) {
-            if (now - context.created > maxAge) {
-                toRemove.push(seed);
-            }
-        }
-
-        for (const seed of toRemove) {
-            const context = this.contexts.get(seed);
-            randomx.releaseContext(context.id);
-            this.contexts.delete(seed);
-            console.log(`Cleaned up context for seed: ${seed.substring(0, 16)}...`);
-        }
-
-        return toRemove.length;
-    }
-
-    /**
-     * Shutdown the pool server
-     */
     shutdown() {
         console.log('Shutting down mining pool...');
 
-        // Release all contexts
-        for (const [seed, context] of this.contexts.entries()) {
-            randomx.releaseContext(context.id);
-            console.log(`Released context ${context.id}`);
-        }
+        this.rxCache.releaseAll();
 
-        this.contexts.clear();
-
-        // Log final stats
         const finalStats = this.getStats();
         console.log('Final Statistics:');
         console.log(`- Valid shares: ${finalStats.pool.validShares}`);
         console.log(`- Invalid shares: ${finalStats.pool.invalidShares}`);
         console.log(`- Total RandomX hashes: ${finalStats.randomx.totalHashes}`);
-        console.log(`- Average hash time: ${finalStats.randomx.averageHashTime.toFixed(3)}ms`);
+        console.log(`- Average hash time (see note in getStats): ${finalStats.randomx.averageHashTime.toFixed(3)}`);
 
         console.log('Pool server shutdown complete');
     }
 }
 
-// Demo usage
 function runDemo() {
     const pool = new MiningPool();
 
-    // Simulate some mining activity
     const seedHex = crypto.randomBytes(32).toString('hex');
     const miners = ['miner1', 'miner2', 'miner3'];
 
     console.log('Starting mining simulation...\n');
 
-    // Simulate share submissions
     let shareCount = 0;
     const submitShare = () => {
         const miner = miners[Math.floor(Math.random() * miners.length)];
         const jobId = crypto.randomBytes(16).toString('hex');
         const nonce = Math.floor(Math.random() * 0xffffffff);
-        const difficulty = Math.pow(2, Math.floor(Math.random() * 10) + 10); // Random difficulty
+        const difficulty = Math.pow(2, Math.floor(Math.random() * 10) + 10);
 
         pool.verifyShare(miner, jobId, nonce, seedHex, difficulty);
         shareCount++;
@@ -231,7 +161,6 @@ function runDemo() {
         if (shareCount < 20) {
             setTimeout(submitShare, 100 + Math.random() * 200);
         } else {
-            // End simulation
             setTimeout(() => {
                 console.log('\nSimulation complete!');
                 console.log('\nFinal Pool Statistics:');
@@ -242,24 +171,9 @@ function runDemo() {
         }
     };
 
-    // Start submitting shares
     submitShare();
-
-    // Periodic cleanup
-    const cleanupInterval = setInterval(() => {
-        const cleaned = pool.cleanupContexts();
-        if (cleaned > 0) {
-            console.log(`Cleaned up ${cleaned} old contexts`);
-        }
-    }, 10000);
-
-    // Stop cleanup when simulation ends
-    setTimeout(() => {
-        clearInterval(cleanupInterval);
-    }, 25000);
 }
 
-// Run the demo if this file is executed directly
 if (require.main === module) {
     runDemo();
 }

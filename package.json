@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "test": "node test/test.js",
+    "test:fast-mode": "node test/fast-mode.test.js",
     "install": "node-gyp rebuild",
     "build": "node-gyp build",
     "clean": "node-gyp clean && rm -rf deps/randomx",

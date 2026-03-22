@@ -48,8 +48,18 @@ struct RandomXContext {
     RandomXConfig config;
     std::atomic<uint64_t> hashCount;
     std::atomic<uint64_t> lastUsed;
+    /** Set at creation: RANDOMX_FLAG_LARGE_PAGES was included in alloc flags. */
+    bool usedLargePages;
+    /** randomx_vm is not thread-safe; serialize hashing like p2pool's per-VM mutex. */
+    std::mutex hashMutex;
 
-    RandomXContext() : dataset(nullptr), cache(nullptr), vm(nullptr), hashCount(0), lastUsed(0) {
+    RandomXContext()
+        : dataset(nullptr),
+          cache(nullptr),
+          vm(nullptr),
+          hashCount(0),
+          lastUsed(0),
+          usedLargePages(false) {
         memset(seed, 0, 32);
     }
 
@@ -94,6 +104,7 @@ private:
 
     // Performance tracking
     std::atomic<uint64_t> totalHashes;
+    std::atomic<uint64_t> totalHashTimeMicros;
     std::atomic<uint64_t> totalVerifications;
     std::atomic<uint64_t> cacheHits;
     std::atomic<uint64_t> cacheMisses;
@@ -113,14 +124,18 @@ public:
     // Context management
     uint32_t createContext(const uint8_t* seed, const RandomXConfig& config);
     bool releaseContext(uint32_t contextId);
-    RandomXContext* getContext(uint32_t contextId);
+    /** @param updateLastUsed if false, do not touch lastUsed (e.g. getContextInfo introspection). */
+    RandomXContext* getContext(uint32_t contextId, bool updateLastUsed = true);
+
+    /** Snapshot metadata for a context (invalid id => false). */
+    bool getContextInfo(uint32_t contextId, bool& outUsedLargePages, bool& outRequestedLargePages, RandomXMode& outMode);
 
     // Statistics and info
     PerformanceStats getStats() const;
     HardwareInfo getHardwareInfo() const;
 
     // Performance tracking
-    void recordHash(uint32_t contextId);
+    void recordHash(uint32_t contextId, uint64_t elapsedMicros);
     void recordVerification(uint32_t contextId);
 };
 

@@ -1,7 +1,11 @@
 /**
  * Test Suite for Node.js RandomX Share Verifier
+ *
+ * Includes fast mode (full RandomX dataset) so regressions are visible in `npm test`.
+ * Optional huge-page smoke: `npm run test:fast-mode`
  */
 
+const os = require('os');
 const randomx = require('../index');
 const crypto = require('crypto');
 const assert = require('assert');
@@ -37,6 +41,11 @@ async function runTests() {
         console.log('Context ID:', contextId);
         assert(typeof contextId === 'number', 'Context ID should be a number');
         assert(contextId > 0, 'Context ID should be positive');
+
+        const meta = randomx.getContextInfo(contextId);
+        assert(meta && meta.mode === 'light', 'getContextInfo mode');
+        assert(meta.enableHugePages === false, 'default enableHugePages');
+        assert(meta.usedLargePages === false, 'no large pages in light default');
         console.log('✓ Context initialization test passed\n');
 
         // Test 3: Hash Calculation
@@ -63,8 +72,8 @@ async function runTests() {
         assert(verificationResult.hash.length === 32, 'Hash should be 32 bytes');
         console.log('✓ Share verification test passed\n');
 
-        // Test 5: Performance Measurement
-        console.log('Test 5: Performance Measurement');
+        // Test 5: Performance measurement on light (cache-only) context
+        console.log('Test 5: Performance Measurement (light mode)');
         const iterations = 1000;
         const startTime = Date.now();
 
@@ -80,7 +89,7 @@ async function runTests() {
         console.log(`Performance: ${hashesPerSecond.toFixed(2)} hashes/second`);
         console.log(`Average time per hash: ${(totalTime / iterations).toFixed(3)} ms`);
         assert(hashesPerSecond > 0, 'Performance should be positive');
-        console.log('✓ Performance measurement test passed\n');
+        console.log('✓ Performance measurement test passed (light mode)\n');
 
         // Test 6: Statistics
         console.log('Test 6: Statistics');
@@ -156,6 +165,121 @@ async function runTests() {
         }
 
         console.log('✓ Error handling test passed\n');
+
+        // Test 10: Context cache (LRU, light mode to keep tests fast)
+        console.log('Test 10: Context cache LRU');
+        const rxCache = randomx.createContextCache({
+            maxContexts: 1,
+            mode: 'light',
+            threads: 1,
+            enableHugePages: false
+        });
+        const cs1 = crypto.randomBytes(32);
+        const cs2 = crypto.randomBytes(32);
+        const cidA = rxCache.getContext(cs1);
+        assert(rxCache.size === 1, 'cache holds one context');
+        const cidB = rxCache.getContext(cs2);
+        assert(rxCache.size === 1, 'still one context after eviction');
+        assert(cidA !== cidB, 'new seed replaces context id');
+        assert(!rxCache.has(cs1), 'first seed evicted under LRU');
+        assert(rxCache.has(cs2), 'second seed retained');
+
+        const h1 = randomx.hash(cidB, testInput);
+        const cidAgain = rxCache.getContextFromHex(cs2.toString('hex'));
+        assert(cidAgain === cidB, 'hex getter returns same context');
+        const h2 = randomx.hash(cidAgain, testInput);
+        assert(h1.equals(h2), 'same hash for same seed and input');
+
+        try {
+            rxCache.getContextFromHex('00');
+            assert(false, 'short hex should throw');
+        } catch (e) {
+            assert(e.message && e.message.includes('64'), 'expected hex length error');
+        }
+
+        rxCache.releaseAll();
+        assert(rxCache.size === 0, 'releaseAll empties cache');
+
+        const epoch = randomx.createPoolEpochCache({ mode: 'light', threads: 1 });
+        assert(epoch.maxContexts === 2, 'createPoolEpochCache defaults maxContexts to 2');
+        epoch.releaseAll();
+        console.log('✓ Context cache test passed\n');
+
+        // Test 10b: Idle eviction — drop unused seed contexts after a grace period (saves RAM in pools)
+        console.log('Test 10b: Context cache idle eviction');
+        const idleRx = randomx.createContextCache({
+            maxContexts: 2,
+            mode: 'light',
+            threads: 1,
+            enableHugePages: false,
+            idleEvictMs: 50
+        });
+        const is1 = crypto.randomBytes(32);
+        const is2 = crypto.randomBytes(32);
+        const idleId1 = idleRx.getContext(is1);
+        idleRx.getContext(is2);
+        assert(idleRx.size === 2);
+        assert(idleRx.getSnapshot().idleEvictMs === 50);
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        const idleId1b = idleRx.getContext(is1);
+        assert(idleId1 !== idleId1b, 'idle eviction should release and recreate context');
+        assert(idleRx.size === 1);
+        idleRx.releaseAll();
+        console.log('✓ Context cache idle eviction passed\n');
+
+        // Test 11: Fast mode (full dataset) — must run in CI/default test; init can take ~10–60s cold
+        console.log('Test 11: Fast mode (full dataset, RANDOMX_FLAG_FULL_MEM)');
+        console.log('  (first-time dataset build; may take a while…)\n');
+        const fastSeed = crypto.randomBytes(32);
+        let fastCtxId;
+        try {
+            const t0 = Date.now();
+            fastCtxId = randomx.initContext(fastSeed, {
+                mode: 'fast',
+                enableHugePages: false,
+                threads: Math.min(4, Math.max(1, os.cpus().length)),
+                enableJit: true,
+                enableAes: true
+            });
+            console.log(`  Context created in ${((Date.now() - t0) / 1000).toFixed(1)}s (id=${fastCtxId})`);
+            assert(typeof fastCtxId === 'number' && fastCtxId > 0, 'fast context id');
+
+            const fastMeta = randomx.getContextInfo(fastCtxId);
+            assert(fastMeta && fastMeta.mode === 'fast', 'getContextInfo mode is fast');
+            assert(fastMeta.usedLargePages === false, 'this test uses enableHugePages: false');
+
+            const fastHash = randomx.hash(fastCtxId, testInput);
+            assert.strictEqual(fastHash.length, 32, 'fast hash length');
+
+            const fastVerify = randomx.verifyShare(fastCtxId, testInput, testTarget);
+            assert(typeof fastVerify.valid === 'boolean');
+            assert.strictEqual(typeof fastVerify.hashTime, 'number');
+            console.log(`  Sample verify hashTime: ${fastVerify.hashTime.toFixed(2)} ms (expect ~1–3 ms typical)`);
+            console.log('✓ Fast mode initialization and verification passed\n');
+
+            // Test 12: Same loop as Test 5, on fast (full dataset) context
+            console.log('Test 12: Performance Measurement (fast mode)');
+            const fastIterations = 1000;
+            const fastPerfStart = Date.now();
+
+            for (let i = 0; i < fastIterations; i++) {
+                const input = Buffer.concat([testInput, Buffer.from([i & 0xff])]);
+                randomx.hash(fastCtxId, input);
+            }
+
+            const fastPerfEnd = Date.now();
+            const fastTotalTime = fastPerfEnd - fastPerfStart;
+            const fastHashesPerSecond = (fastIterations / fastTotalTime) * 1000;
+
+            console.log(`Performance: ${fastHashesPerSecond.toFixed(2)} hashes/second`);
+            console.log(`Average time per hash: ${(fastTotalTime / fastIterations).toFixed(3)} ms`);
+            assert(fastHashesPerSecond > 0, 'Fast mode performance should be positive');
+            console.log('✓ Performance measurement test passed (fast mode)\n');
+        } finally {
+            if (fastCtxId) {
+                randomx.releaseContext(fastCtxId);
+            }
+        }
 
     } catch (error) {
         console.error('Test failed:', error);

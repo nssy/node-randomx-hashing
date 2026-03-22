@@ -9,6 +9,19 @@
 #include <string>
 #include <memory>
 
+static const char* randomModeToString(RandomXMode mode) {
+    switch (mode) {
+        case RandomXMode::FAST:
+            return "fast";
+        case RandomXMode::LIGHT:
+            return "light";
+        case RandomXMode::AUTO:
+            return "auto";
+        default:
+            return "unknown";
+    }
+}
+
 /**
  * Initialize RandomX context with specified configuration
  */
@@ -196,6 +209,33 @@ Napi::Value GetStats(const Napi::CallbackInfo& info) {
 }
 
 /**
+ * Per-context runtime metadata (mode, large-page usage)
+ */
+Napi::Value GetContextInfo(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        Napi::TypeError::New(env, "Expected contextId (number)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    uint32_t contextId = info[0].As<Napi::Number>().Uint32Value();
+    bool usedLargePages = false;
+    bool requestedLargePages = false;
+    RandomXMode mode = RandomXMode::LIGHT;
+
+    if (!ContextManager::getInstance().getContextInfo(contextId, usedLargePages, requestedLargePages, mode)) {
+        return env.Null();
+    }
+
+    Napi::Object o = Napi::Object::New(env);
+    o.Set("mode", Napi::String::New(env, randomModeToString(mode)));
+    o.Set("enableHugePages", Napi::Boolean::New(env, requestedLargePages));
+    o.Set("usedLargePages", Napi::Boolean::New(env, usedLargePages));
+    return o;
+}
+
+/**
  * Get hardware capability information
  */
 Napi::Value GetHardwareInfo(const Napi::CallbackInfo& info) {
@@ -224,6 +264,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("releaseContext", Napi::Function::New(env, ReleaseContext));
     exports.Set("getStats", Napi::Function::New(env, GetStats));
     exports.Set("getHardwareInfo", Napi::Function::New(env, GetHardwareInfo));
+    exports.Set("getContextInfo", Napi::Function::New(env, GetContextInfo));
 
     return exports;
 }

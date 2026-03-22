@@ -5,9 +5,11 @@
 
 #include "share_verifier.h"
 #include "context_manager.h"
+#include <chrono>
 #include <cstring>
 #include <cmath>
 #include <limits>
+#include <mutex>
 
 extern "C" {
     #include "randomx.h"
@@ -69,17 +71,20 @@ bool ShareVerifier::calculateHash(
     size_t inputLength,
     uint8_t* output
 ) {
-    // Get RandomX context
     RandomXContext* context = ContextManager::getInstance().getContext(contextId);
     if (!context || !context->vm) {
         return false;
     }
 
-    // Calculate hash using RandomX VM
-    randomx_calculate_hash(context->vm, input, inputLength, output);
+    std::lock_guard<std::mutex> lock(context->hashMutex);
 
-    // Record hash operation for performance tracking
-    ContextManager::getInstance().recordHash(contextId);
+    auto t0 = std::chrono::high_resolution_clock::now();
+    randomx_calculate_hash(context->vm, input, inputLength, output);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    const uint64_t micros = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+
+    ContextManager::getInstance().recordHash(contextId, micros);
 
     return true;
 }
