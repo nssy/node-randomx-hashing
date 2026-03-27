@@ -12,6 +12,9 @@
 #include <mutex>
 #include <atomic>
 #include <cstring>
+#include <array>
+#include <string>
+#include <condition_variable>
 
 extern "C" {
     #include "randomx.h"
@@ -21,7 +24,6 @@ extern "C" {
  * RandomX mode enumeration
  */
 enum class RandomXMode {
-    AUTO,   // Automatically choose based on usage
     FAST,   // Full memory mode (~2GB) - for mining
     LIGHT   // Light mode (~256MB) - for verification
 };
@@ -37,33 +39,50 @@ struct RandomXConfig {
     RandomXMode mode;
 };
 
-/**
- * RandomX context wrapper
- */
-struct RandomXContext {
+struct RandomXSeedResources {
     randomx_dataset* dataset;
     randomx_cache* cache;
-    randomx_vm* vm;
     uint8_t seed[32];
     RandomXConfig config;
-    std::atomic<uint64_t> hashCount;
-    std::atomic<uint64_t> lastUsed;
-    /** Set at creation: RANDOMX_FLAG_LARGE_PAGES was included in alloc flags. */
+    randomx_flags flags;
     bool usedLargePages;
-    /** randomx_vm is not thread-safe; serialize hashing like p2pool's per-VM mutex. */
-    std::mutex hashMutex;
 
-    RandomXContext()
+    RandomXSeedResources()
         : dataset(nullptr),
           cache(nullptr),
-          vm(nullptr),
-          hashCount(0),
-          lastUsed(0),
+          flags(RANDOMX_FLAG_DEFAULT),
           usedLargePages(false) {
         memset(seed, 0, 32);
     }
 
+    ~RandomXSeedResources();
+};
+
+/**
+ * RandomX context wrapper
+ */
+struct RandomXContext {
+    std::shared_ptr<RandomXSeedResources> resources;
+    randomx_vm* vm;
+    std::atomic<uint64_t> hashCount;
+    std::atomic<uint64_t> lastUsed;
+    /** randomx_vm is not thread-safe; serialize hashing like p2pool's per-VM mutex. */
+    std::mutex hashMutex;
+
+    RandomXContext()
+        : resources(),
+          vm(nullptr),
+          hashCount(0),
+          lastUsed(0) {}
+
     ~RandomXContext();
+};
+
+struct RandomXSeedInitState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+    std::shared_ptr<RandomXSeedResources> resources;
 };
 
 /**
@@ -73,6 +92,7 @@ struct PerformanceStats {
     uint64_t totalHashes;
     uint64_t totalVerifications;
     uint32_t activeContexts;
+    uint32_t activeSeeds;
     double averageHashTime;
     uint64_t cacheHits;
     uint64_t cacheMisses;
@@ -98,8 +118,11 @@ private:
     static std::unique_ptr<ContextManager> instance;
     static std::mutex instanceMutex;
 
-    std::unordered_map<uint32_t, std::unique_ptr<RandomXContext>> contexts;
+    std::unordered_map<uint32_t, std::shared_ptr<RandomXContext>> contexts;
     std::mutex contextsMutex;
+    std::unordered_map<std::string, std::weak_ptr<RandomXSeedResources>> seedResources;
+    std::unordered_map<std::string, std::shared_ptr<RandomXSeedInitState>> seedInitStates;
+    std::mutex seedResourcesMutex;
     std::atomic<uint32_t> nextContextId;
 
     // Performance tracking
@@ -111,10 +134,9 @@ private:
 
     ContextManager();
 
-    // Hardware setup functions
-    void setupHugePages();
-    void optimizeHardware();
     randomx_flags getOptimalFlags(const RandomXConfig& config);
+    std::string makeSeedKey(const uint8_t* seed, const RandomXConfig& config) const;
+    std::shared_ptr<RandomXSeedResources> acquireSeedResources(const uint8_t* seed, const RandomXConfig& config);
 
 public:
     static ContextManager& getInstance();
@@ -125,7 +147,7 @@ public:
     uint32_t createContext(const uint8_t* seed, const RandomXConfig& config);
     bool releaseContext(uint32_t contextId);
     /** @param updateLastUsed if false, do not touch lastUsed (e.g. getContextInfo introspection). */
-    RandomXContext* getContext(uint32_t contextId, bool updateLastUsed = true);
+    std::shared_ptr<RandomXContext> getContext(uint32_t contextId, bool updateLastUsed = true);
 
     /** Snapshot metadata for a context (invalid id => false). */
     bool getContextInfo(uint32_t contextId, bool& outUsedLargePages, bool& outRequestedLargePages, RandomXMode& outMode);

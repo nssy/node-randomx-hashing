@@ -8,9 +8,9 @@
  *   4. Verify shares with the same blob + seed the miner used.
  *
  * P2pool keeps two RandomX key slots (current + previous epoch). We mirror that with
- * `createPoolEpochCache` — default `maxContexts: 2` (~2× ~2GB RAM in fast mode if both loaded).
- * If you drop old jobs immediately on template change, use `maxContexts: 1` to halve peak memory,
- * or keep `maxContexts: 2` and set `idleEvictMs` (e.g. 60_000) so the previous-seed VM is released
+ * `createPoolSeedPool` — default `maxSeeds: 2` (current + previous seed_hash).
+ * If you drop old jobs immediately on template change, use `maxSeeds: 1` to halve peak memory,
+ * or keep `maxSeeds: 2` and set `idleEvictMs` (e.g. 60_000) so the previous-seed VM is released
  * after a short grace period when nothing touches it (pools rarely resend old seed_hash).
  *
  * This file does not depend on cryptonote-util; it shows where RandomX fits.
@@ -27,9 +27,9 @@ const randomx = require('../index');
  */
 function createPoolVerifier(opts = {}) {
     const fast = opts.fast !== false;
-    return randomx.createPoolEpochCache({
+    return randomx.createPoolSeedPool({
         // 2 = current + previous seed_hash; 1 = less RAM if you never verify old jobs
-        maxContexts: opts.maxContexts != null ? opts.maxContexts : 2,
+        maxSeeds: opts.maxSeeds != null ? opts.maxSeeds : 2,
         mode: fast ? 'fast' : 'light',
         threads: opts.threads != null ? opts.threads : Math.max(1, os.cpus().length),
         enableHugePages: opts.enableHugePages === true,
@@ -43,19 +43,18 @@ function createPoolVerifier(opts = {}) {
  * Example: verify a share the same way you would after `randomX(blob, seedBuf, 0)`
  * from cryptonight-hashing — same inputs, but context is reused via seed_hash.
  *
- * **When `seedHashHex` changes:** `getContextFromHex` looks up that seed in the LRU cache.
+ * **When `seedHashHex` changes:** `verifyShareFromHex` looks up that seed in the LRU cache.
  * - First time this seed is seen → **new** `initContext` (full dataset init in fast mode; costly once per epoch).
- * - Seed still in cache (e.g. current + previous job with `maxContexts: 2`) → **same context id**, no re-init.
+ * - Seed still in cache (e.g. current + previous job with `maxSeeds: 2`) → **same seed resources**, no re-init.
  * - New seed and cache full → **evicts** LRU entry, creates context for the new seed (releases old VM).
  *
- * @param {import('../index').RandomXContextCache} cache
+ * @param {import('../index').SeedPool} cache
  * @param {string} seedHashHex — from block template: `blockTemplate.seed_hash`
  * @param {Buffer} blockBlob — full block blob with nonce (what miners hash)
  * @param {Buffer} target — 32-byte pool target (from difficulty)
  */
 function verifyShareCryptonoteStyle(cache, seedHashHex, blockBlob, target) {
-    const contextId = cache.getContextFromHex(seedHashHex);
-    return randomx.verifyShare(contextId, blockBlob, target);
+    return cache.verifyShareFromHex(seedHashHex, blockBlob, target);
 }
 
 /**
@@ -97,6 +96,6 @@ if (require.main === module) {
 module.exports = {
     createPoolVerifier,
     verifyShareCryptonoteStyle,
-    createContextCache: randomx.createContextCache,
-    createPoolEpochCache: randomx.createPoolEpochCache
+    createSeedPool: randomx.createSeedPool,
+    createPoolSeedPool: randomx.createPoolSeedPool
 };

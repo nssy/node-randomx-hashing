@@ -1,6 +1,6 @@
 /**
  * Example mining pool server using RandomX share verification
- * Uses createContextCache (LRU) so multiple seed_hash values can coexist
+ * Uses createSeedPool (LRU) so multiple seed_hash values can coexist
  * during fork transitions without unbounded RAM growth.
  */
 
@@ -10,8 +10,8 @@ const crypto = require('crypto');
 
 class MiningPool {
     constructor() {
-        this.rxCache = randomx.createContextCache({
-            maxContexts: 2,
+        this.rxCache = randomx.createSeedPool({
+            maxSeeds: 2,
             mode: 'fast',
             threads: Math.max(1, os.cpus().length),
             enableHugePages: false
@@ -40,19 +40,10 @@ class MiningPool {
     }
 
     /**
-     * Resolve RandomX context for seed_hash (LRU inside rxCache).
-     */
-    getContextId(seedHex) {
-        return this.rxCache.getContextFromHex(seedHex);
-    }
-
-    /**
      * Verify a mining share
      */
     verifyShare(minerAddress, jobId, nonce, seedHex, difficulty) {
         try {
-            const contextId = this.getContextId(seedHex);
-
             const shareData = Buffer.concat([
                 Buffer.from(jobId, 'hex'),
                 Buffer.from(minerAddress, 'utf8'),
@@ -62,7 +53,7 @@ class MiningPool {
             const target = this.difficultyToTarget(difficulty);
 
             const startTime = Date.now();
-            const result = randomx.verifyShare(contextId, shareData, target);
+            const result = this.rxCache.verifyShareFromHex(seedHex, shareData, target);
             const verifyTime = Date.now() - startTime;
 
             const shareInfo = {

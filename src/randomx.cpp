@@ -8,6 +8,8 @@
 #include "share_verifier.h"
 #include <string>
 #include <memory>
+#include <array>
+#include <vector>
 
 static const char* randomModeToString(RandomXMode mode) {
     switch (mode) {
@@ -15,12 +17,62 @@ static const char* randomModeToString(RandomXMode mode) {
             return "fast";
         case RandomXMode::LIGHT:
             return "light";
-        case RandomXMode::AUTO:
-            return "auto";
         default:
             return "unknown";
     }
 }
+
+class HashAsyncWorker : public Napi::AsyncWorker {
+public:
+    HashAsyncWorker(
+        Napi::Env env,
+        std::shared_ptr<RandomXContext> context,
+        uint32_t contextId,
+        const uint8_t* input,
+        size_t inputLength
+    )
+        : Napi::AsyncWorker(env),
+          deferred(Napi::Promise::Deferred::New(env)),
+          context(std::move(context)),
+          contextId(contextId),
+          input(input, input + inputLength) {}
+
+    void Execute() override {
+        if (!context || !context->vm) {
+            SetError("Hash calculation failed: invalid context");
+            return;
+        }
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(context->hashMutex);
+            randomx_calculate_hash(context->vm, input.data(), input.size(), output.data());
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        const uint64_t micros = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+        ContextManager::getInstance().recordHash(contextId, micros);
+    }
+
+    void OnOK() override {
+        deferred.Resolve(Napi::Buffer<uint8_t>::Copy(Env(), output.data(), output.size()));
+    }
+
+    void OnError(const Napi::Error& error) override {
+        deferred.Reject(error.Value());
+    }
+
+    Napi::Promise GetPromise() const {
+        return deferred.Promise();
+    }
+
+private:
+    Napi::Promise::Deferred deferred;
+    std::shared_ptr<RandomXContext> context;
+    uint32_t contextId;
+    std::vector<uint8_t> input;
+    std::array<uint8_t, 32> output = {};
+};
 
 /**
  * Initialize RandomX context with specified configuration
@@ -68,8 +120,6 @@ Napi::Value InitContext(const Napi::CallbackInfo& info) {
                 config.mode = RandomXMode::FAST;
             } else if (mode == "light") {
                 config.mode = RandomXMode::LIGHT;
-            } else if (mode == "auto") {
-                config.mode = RandomXMode::AUTO;
             }
         }
     }
@@ -169,6 +219,31 @@ Napi::Value Hash(const Napi::CallbackInfo& info) {
 }
 
 /**
+ * Calculate RandomX hash asynchronously on the libuv worker pool.
+ */
+Napi::Value HashAsync(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsBuffer()) {
+        Napi::TypeError::New(env, "Expected contextId (number) and input (Buffer)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    uint32_t contextId = info[0].As<Napi::Number>().Uint32Value();
+    Napi::Buffer<uint8_t> input = info[1].As<Napi::Buffer<uint8_t>>();
+    auto context = ContextManager::getInstance().getContext(contextId);
+    if (!context || !context->vm) {
+        Napi::Error::New(env, "Hash calculation failed: invalid context").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    auto* worker = new HashAsyncWorker(env, std::move(context), contextId, input.Data(), input.Length());
+    auto promise = worker->GetPromise();
+    worker->Queue();
+    return promise;
+}
+
+/**
  * Release a RandomX context
  */
 Napi::Value ReleaseContext(const Napi::CallbackInfo& info) {
@@ -201,6 +276,7 @@ Napi::Value GetStats(const Napi::CallbackInfo& info) {
     statsObj.Set("totalHashes", Napi::Number::New(env, stats.totalHashes));
     statsObj.Set("totalVerifications", Napi::Number::New(env, stats.totalVerifications));
     statsObj.Set("activeContexts", Napi::Number::New(env, stats.activeContexts));
+    statsObj.Set("activeSeeds", Napi::Number::New(env, stats.activeSeeds));
     statsObj.Set("averageHashTime", Napi::Number::New(env, stats.averageHashTime));
     statsObj.Set("cacheHits", Napi::Number::New(env, stats.cacheHits));
     statsObj.Set("cacheMisses", Napi::Number::New(env, stats.cacheMisses));
@@ -261,6 +337,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("initContext", Napi::Function::New(env, InitContext));
     exports.Set("verifyShare", Napi::Function::New(env, VerifyShare));
     exports.Set("hash", Napi::Function::New(env, Hash));
+    exports.Set("hashAsync", Napi::Function::New(env, HashAsync));
     exports.Set("releaseContext", Napi::Function::New(env, ReleaseContext));
     exports.Set("getStats", Napi::Function::New(env, GetStats));
     exports.Set("getHardwareInfo", Napi::Function::New(env, GetHardwareInfo));

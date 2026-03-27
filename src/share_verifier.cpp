@@ -30,7 +30,7 @@ bool ShareVerifier::verifyShare(
     auto startTime = std::chrono::high_resolution_clock::now();
 
     // Get RandomX context
-    RandomXContext* context = ContextManager::getInstance().getContext(contextId);
+    auto context = ContextManager::getInstance().getContext(contextId);
     if (!context || !context->vm) {
         return false;
     }
@@ -71,7 +71,7 @@ bool ShareVerifier::calculateHash(
     size_t inputLength,
     uint8_t* output
 ) {
-    RandomXContext* context = ContextManager::getInstance().getContext(contextId);
+    auto context = ContextManager::getInstance().getContext(contextId);
     if (!context || !context->vm) {
         return false;
     }

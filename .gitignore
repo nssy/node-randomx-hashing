@@ -11,6 +11,9 @@ build/
 # Dependencies
 node_modules/
 deps/
+!deps/randomx/
+!deps/randomx/**
+deps/randomx/build/
 
 # OS files
 .DS_Store

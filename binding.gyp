@@ -1,21 +1,33 @@
 {
   "targets": [
     {
-      "target_name": "download_randomx",
+      "target_name": "check_randomx_vendor",
       "type": "none",
       "actions": [
         {
-          "action_name": "download_randomx",
+          "action_name": "check_randomx_vendor",
           "inputs": [],
           "outputs": ["<(module_root_dir)/deps/randomx/CMakeLists.txt"],
-          "action": ["node", "<(module_root_dir)/scripts/download-randomx.js"]
+          "conditions": [
+            ["OS=='win'", {
+              "action": [
+                "cmd", "/c",
+                "if exist <(module_root_dir)\\deps\\randomx\\CMakeLists.txt (exit /b 0) else (echo Missing vendored RandomX source at deps\\randomx & echo Reinstall the package from a complete source archive or git checkout & exit /b 1)"
+              ]
+            }, {
+              "action": [
+                "sh", "-c",
+                "test -f '<(module_root_dir)/deps/randomx/CMakeLists.txt' || { echo 'Missing vendored RandomX source at deps/randomx'; echo 'Reinstall the package from a complete source archive or git checkout'; exit 1; }"
+              ]
+            }]
+          ]
         }
       ]
     },
     {
       "target_name": "build_randomx",
       "type": "none",
-      "dependencies": ["download_randomx"],
+      "dependencies": ["check_randomx_vendor"],
       "actions": [
         {
           "action_name": "build_randomx_lib",
@@ -28,12 +40,12 @@
               "outputs": ["<(module_root_dir)/deps/randomx/build/Release/randomx.lib"],
               "action": [
                 "cmd", "/c",
-                "cd <(module_root_dir)/deps/randomx && mkdir build 2>NUL || cd build && cmake .. -DCMAKE_BUILD_TYPE=Release -DRANDOMX_HAVE_JIT=ON -DRANDOMX_HAVE_AES=ON && cmake --build . --config Release"
+                "cd <(module_root_dir)/deps/randomx && if exist build rmdir /S /Q build & mkdir build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release -DRANDOMX_HAVE_JIT=ON -DRANDOMX_HAVE_AES=ON && cmake --build . --config Release"
               ]
             }, {
               "action": [
                 "sh", "-c",
-                "cd '<(module_root_dir)/deps/randomx' && mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release -DRANDOMX_HAVE_JIT=ON -DRANDOMX_HAVE_AES=ON -DCMAKE_C_FLAGS='-O3 -march=native -mtune=native' -DCMAKE_CXX_FLAGS='-O3 -march=native -mtune=native' && make -j$(nproc 2>/dev/null || echo 4)"
+                "cd '<(module_root_dir)/deps/randomx' && rm -rf build && mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release -DRANDOMX_HAVE_JIT=ON -DRANDOMX_HAVE_AES=ON -DCMAKE_C_FLAGS='-O3 -march=native -mtune=native' -DCMAKE_CXX_FLAGS='-O3 -march=native -mtune=native' && make -j$(nproc 2>/dev/null || echo 4)"
               ]
             }]
           ]
@@ -81,8 +93,7 @@
           ],
           "link_settings": {
             "libraries": [
-              "-lpthread",
-              "-lnuma"
+              "-lpthread"
             ]
           },
           "defines": [

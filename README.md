@@ -1,22 +1,31 @@
 # Node.js RandomX Share Verifier
 
-A high-performance N-API addon for RandomX share verification in Node.js mining pools. Built for speed with JIT compilation, AES acceleration, and optimized context reuse.
+A high-performance N-API addon for RandomX hashing and share verification in Node.js mining pools.
+
+The primary API is now a `SeedPool`:
+- one shared RandomX cache/dataset per seed
+- a small VM pool per seed for concurrency
+- direct `hashAsync(seed, input)` / `verifyShare(seed, ...)` calls
+
+That maps much better to real pool workloads than making application code manage raw context ids.
 
 ## Features
 
 - **Native Performance**: N-API addon with JIT compilation and AES acceleration
-- **Context Reuse**: Efficient cache and VM reuse across share verifications
-- **Hardware Optimization**: NUMA-aware memory, huge pages, and optimized CPU settings
+- **Shared Seed Resources**: One RandomX cache/dataset per seed, reused across multiple VMs
+- **VM Pooling**: Multiple VMs can share the same seed resources for concurrent pool workloads
+- **Pool Broker Friendly**: Works well behind a local socket broker shared by many pool workers
 - **Pool-Ready**: Designed specifically for mining pool server workloads
 - **Cross-Platform**: Supports Linux, Windows, and macOS
-- **Zero-Config Build**: Fully automated RandomX download and compilation
+- **Vendored RandomX Source**: Builds from pinned local RandomX source in `deps/randomx`
 
 ## Performance
 
 - **JIT Compilation**: Near-native speed RandomX execution
 - **AES Hardware**: Hardware-accelerated AES when available
-- **Memory Optimization**: Large pages and NUMA-aware allocation
-- **Context Pooling**: Reusable RandomX contexts minimize initialization overhead
+- **Memory Optimization**: Shared seed resources and optional large pages
+- **Seed Reuse**: Current/previous `seed_hash` values stay warm without rebuilding full datasets
+- **Async Hashing**: `hashAsync()` lets Node brokers overlap requests without blocking the event loop
 
 ## Installation
 
@@ -34,78 +43,114 @@ sudo yum install cmake git
 brew install cmake git
 ```
 
-### Install from npm (coming soon)
+### Install from npm 
 
 ```bash
-npm install node-randomx-hashing
+npm install "git+https://github.com/nssy/node-randomx-hashing.git"
 ```
 
 ### Build from Source
 
 ```bash
-git clone https://github.com/your-repo/node-randomx-hashing.git
+git clone https://github.com/nssy/node-randomx-hashing.git
 cd node-randomx-hashing
 
-# Everything is fully automated - just install!
+# Build the addon
 npm install
 ```
 
-**That's it!** 🎉 The build system automatically:
-- Downloads RandomX library from GitHub
-- Configures and builds RandomX with optimal settings
-- Compiles the N-API addon
-- Links everything together
-
-No manual scripts or additional setup required!
+**That's it!** The build system:
+- verifies `deps/randomx` exists
+- configures and builds RandomX from local source
+- compiles the N-API addon
+- links everything together
 
 ## Quick Start
 
 ```javascript
 const randomx = require('node-randomx-hashing');
 
-// Initialize context with RandomX seed
-const seed = Buffer.from('your-32-byte-seed-here...');
-const contextId = randomx.initContext(seed, {
-    enableJit: true,        // Enable JIT compilation
-    enableAes: true,        // Enable AES acceleration
-    enableHugePages: false, // Disabled for multi-context stability
-    threads: 1              // Single-threaded for pool use
+// Primary API: a seed pool for current + previous seed_hash
+const pool = randomx.createPoolSeedPool({
+    maxSeeds: 2,
+    vmPoolSize: 2,
+    mode: 'fast',           // explicit: fast is never implied by magic
+    threads: 4,             // dataset init threads
+    enableHugePages: false
 });
 
-// Verify a mining share
+const seed = Buffer.alloc(32, 1);
 const input = Buffer.from('mining-share-data');
-const target = Buffer.from('difficulty-target-32-bytes');
+const target = Buffer.alloc(32, 0xff);
 
-const result = randomx.verifyShare(contextId, input, target);
+const result = pool.verifyShare(seed, input, target);
 console.log('Share valid:', result.valid);
-console.log('Difficulty:', result.difficulty);
 console.log('Hash time:', result.hashTime, 'ms');
 
-// Calculate hash only
-const hash = randomx.hash(contextId, input);
+// Async hashing, useful for broker/server patterns
+const hash = await pool.hashAsync(seed, input);
 console.log('Hash:', hash.toString('hex'));
 
 // Clean up when done
-randomx.releaseContext(contextId);
+pool.releaseAll();
 ```
 
 ## API Reference
 
 ### `initContext(seed, options)`
 
-Initialize a RandomX context for share verification.
+Low-level API. Initialize a single RandomX VM context for a seed.
+
+For pool workloads, prefer `createSeedPool()` / `createPoolSeedPool()`.
 
 **Parameters:**
 - `seed` (Buffer): 32-byte RandomX seed
 - `options` (Object): Configuration options
+  - `mode` (string): `"light"` or `"fast"` (default: `"light"`)
   - `enableJit` (boolean): Enable JIT compilation (default: true)
   - `enableAes` (boolean): Enable AES acceleration (default: true)
-  - `enableHugePages` (boolean): Enable large pages (default: true)
+  - `enableHugePages` (boolean): Enable large pages (default: false)
   - `threads` (number): Initialization threads (default: 1)
 
 **Returns:** Context ID (number)
 
+### `createSeedPool(options)`
+
+Primary high-level API for pools and brokers.
+
+**Parameters:**
+- `options.maxSeeds` (number, default `2`): how many different seeds to retain
+- `options.vmPoolSize` (number, default `1`): how many VMs to create per seed
+- `options.mode` (string, default `"light"`): `"light"` or `"fast"`
+- `options.threads` (number, default `os.cpus().length`): dataset init threads
+- `options.enableJit` (boolean)
+- `options.enableAes` (boolean)
+- `options.enableHugePages` (boolean)
+- `options.idleEvictMs` (number): evict idle seeds after this many ms
+
+**Returns:** `SeedPool`
+
+### `createPoolSeedPool(options)`
+
+Convenience wrapper around `createSeedPool()` with the same semantics.
+Use this when your workload is specifically RandomX epoch based (current + previous seed).
+
+### `SeedPool`
+
+Important methods:
+- `hash(seed, input)`
+- `hashAsync(seed, input)`
+- `verifyShare(seed, input, target, expectedHash?)`
+- `hashFromHex(seedHex, input)`
+- `hashAsyncFromHex(seedHex, input)`
+- `verifyShareFromHex(seedHex, input, target, expectedHash?)`
+- `getContext(seed)` / `getContextFromHex(seedHex)` for low-level interop
+- `release(seed)` / `releaseFromHex(seedHex)` / `releaseAll()`
+- `getSnapshot()`
+
 ### `verifyShare(contextId, input, target, expectedHash?)`
+
+Low-level API for raw context ids.
 
 Verify a mining share against difficulty target.
 
@@ -123,6 +168,8 @@ Verify a mining share against difficulty target.
 
 ### `hash(contextId, input)`
 
+Low-level API for raw context ids.
+
 Calculate RandomX hash for given input.
 
 **Parameters:**
@@ -130,6 +177,19 @@ Calculate RandomX hash for given input.
 - `input` (Buffer): Data to hash
 
 **Returns:** 32-byte hash (Buffer)
+
+### `hashAsync(contextId, input)`
+
+Calculate RandomX hash asynchronously on libuv's worker pool.
+
+This is the preferred primitive for Node.js broker/server patterns where one process
+handles many concurrent requests against a shared set of RandomX VMs.
+
+**Parameters:**
+- `contextId` (number): Context ID from `initContext`
+- `input` (Buffer): Data to hash
+
+**Returns:** `Promise<Buffer>`
 
 ### `releaseContext(contextId)`
 
@@ -146,6 +206,7 @@ Get performance statistics.
 - `totalHashes` (number): Total hashes calculated
 - `totalVerifications` (number): Total shares verified
 - `activeContexts` (number): Active context count
+- `activeSeeds` (number): Active shared seed-resource count
 - `averageHashTime` (number): Average hash time in ms
 - `cacheHits` (number): Context cache hits
 - `cacheMisses` (number): Context cache misses
@@ -164,15 +225,14 @@ Get hardware capability information.
 
 ## Build System
 
-The build system is **fully automated** and handles everything:
+The build system is local-source based and builds from the vendored `deps/randomx` source tree included in the package:
 
 ### What Happens During `npm install`
 
-1. **Download RandomX**: Automatically clones RandomX v1.2.1 from GitHub
+1. **Check Vendored Source**: Verifies `deps/randomx` exists
 2. **Configure RandomX**: Uses CMake with optimal performance settings
-3. **Build RandomX**: Compiles the static library with JIT and AES support
+3. **Build RandomX**: Compiles the static library from local source
 4. **Build Addon**: Compiles the N-API addon and links against RandomX
-5. **Verify Installation**: Ensures everything works correctly
 
 ### Build Configuration
 
@@ -181,15 +241,18 @@ The build system automatically applies optimal settings:
 - **Compiler Flags**: `-O3 -march=native -mtune=native -ffast-math`
 - **RandomX Features**: JIT compilation + AES acceleration enabled
 - **Cross-Platform**: Handles Linux, Windows, and macOS differences
-- **Dependencies**: Automatically manages NUMA, pthread, and other system libs
+- **Dependencies**: Automatically manages pthread and native build inputs
 
 ### Manual Build Control
 
 ```bash
-# Clean everything (including downloaded RandomX)
+# Clean local build output
 npm run clean
 
-# Force rebuild
+# Rebuild addon + native library
+npm run build
+
+# Full install/build
 npm install
 
 # Verify installation
@@ -222,31 +285,41 @@ taskset -c 0-3 node your-pool-server.js
 ### Context Management
 
 ```javascript
-// Pool server example with context management
+// Pool server example with the primary seed-pool API
 class PoolServer {
     constructor() {
-        this.contexts = new Map();
+        this.contexts = randomx.createPoolSeedPool({
+            maxSeeds: 2,      // current + previous seed_hash
+            vmPoolSize: 2,    // two VMs can share one dataset for concurrent work
+            mode: 'fast',
+            enableHugePages: false
+        });
     }
 
     getContext(seedHex) {
-        if (!this.contexts.has(seedHex)) {
-            const seed = Buffer.from(seedHex, 'hex');
-            const contextId = randomx.initContext(seed, {
-                enableJit: true,
-                enableAes: true,
-                enableHugePages: false // Safer for multiple contexts
-            });
-            this.contexts.set(seedHex, contextId);
-        }
-        return this.contexts.get(seedHex);
+        return this.contexts.getContextFromHex(seedHex);
     }
 
     verifyShare(seedHex, shareData, target) {
-        const contextId = this.getContext(seedHex);
-        return randomx.verifyShare(contextId, shareData, target);
+        return this.contexts.verifyShareFromHex(seedHex, shareData, target);
     }
 }
 ```
+
+### Pool Broker Pattern
+
+For real pool deployments, a useful pattern is:
+
+- keep RandomX in one or a few broker processes
+- let pool workers send hash requests over a local socket
+- use `createPoolSeedPool({ maxSeeds: 2, vmPoolSize: N, mode: 'fast' })`
+- call `seedPool.hashAsync(seed, input)` inside the broker so one process can overlap requests
+
+See:
+
+- `examples/pool-broker.js`
+- `examples/pool-cryptonote-style.js`
+- `examples/pool-server.js`
 
 ## Benchmarks
 
@@ -275,7 +348,7 @@ npm run verify
 # Run tests
 npm test
 
-# Clean everything
+# Clean local build output
 npm run clean
 ```
 
@@ -283,9 +356,10 @@ npm run clean
 
 The build system includes several automated features:
 
-- **Dependency Detection**: Automatically checks for git, cmake, build tools
+- **Vendored Source Check**: Fails fast if the package is incomplete and `deps/randomx` is missing
+- **Dependency Detection**: Automatically checks for cmake and build tools
 - **Platform Detection**: Handles Linux, Windows, macOS differences automatically
-- **Version Management**: Always uses tested RandomX version (v1.2.1)
+- **Version Pinning**: Uses the pinned vendored RandomX revision
 - **Error Handling**: Clear error messages for missing dependencies
 - **Incremental Builds**: Only rebuilds what's necessary
 
@@ -293,11 +367,11 @@ The build system includes several automated features:
 
 ### Common Issues
 
-**Build fails with "git not found":**
+**Build fails with missing `deps/randomx`:**
 ```bash
-# Install git
-sudo apt-get install git  # Ubuntu/Debian
-brew install git          # macOS
+# The package source is incomplete. Reinstall from a complete git checkout or archive.
+rm -rf node_modules/randomx-hashing
+npm install
 ```
 
 **Build fails with "cmake not found":**
@@ -307,16 +381,10 @@ sudo apt-get install cmake  # Ubuntu/Debian
 brew install cmake          # macOS
 ```
 
-**NUMA library not found:**
-```bash
-# Install NUMA development library
-sudo apt-get install libnuma-dev  # Ubuntu/Debian
-```
-
 **Large pages not available:**
 - This is normal and doesn't affect functionality
-- Large pages are automatically disabled for stability with multiple contexts
-- Can be enabled for single-context high-performance scenarios
+- Large pages are off unless explicitly requested
+- For pool brokers, start with `enableHugePages: false` and only enable after verifying the host can satisfy allocation reliably
 
 ### Build Verification
 
