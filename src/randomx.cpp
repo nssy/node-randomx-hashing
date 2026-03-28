@@ -22,6 +22,86 @@ static const char* randomModeToString(RandomXMode mode) {
     }
 }
 
+static bool parseConfigFromValue(Napi::Env env, const Napi::Value& value, RandomXConfig& config) {
+    config = {};
+    config.enableJit = true;
+    config.enableAes = true;
+    config.enableHugePages = false;
+    config.threads = 1;
+    config.mode = RandomXMode::LIGHT;
+
+    if (!value.IsObject()) {
+        return true;
+    }
+
+    Napi::Object options = value.As<Napi::Object>();
+
+    if (options.Has("enableJit")) {
+        config.enableJit = options.Get("enableJit").As<Napi::Boolean>().Value();
+    }
+    if (options.Has("enableAes")) {
+        config.enableAes = options.Get("enableAes").As<Napi::Boolean>().Value();
+    }
+    if (options.Has("enableHugePages")) {
+        config.enableHugePages = options.Get("enableHugePages").As<Napi::Boolean>().Value();
+    }
+    if (options.Has("threads")) {
+        config.threads = options.Get("threads").As<Napi::Number>().Uint32Value();
+    }
+    if (options.Has("mode")) {
+        std::string mode = options.Get("mode").As<Napi::String>().Utf8Value();
+        if (mode == "fast") {
+            config.mode = RandomXMode::FAST;
+        } else if (mode == "light") {
+            config.mode = RandomXMode::LIGHT;
+        } else {
+            Napi::TypeError::New(env, "Mode must be \"fast\" or \"light\"").ThrowAsJavaScriptException();
+            return false;
+        }
+    }
+
+    return true;
+}
+
+class InitContextAsyncWorker : public Napi::AsyncWorker {
+public:
+    InitContextAsyncWorker(
+        Napi::Env env,
+        const uint8_t* seed,
+        const RandomXConfig& config
+    )
+        : Napi::AsyncWorker(env),
+          deferred(Napi::Promise::Deferred::New(env)),
+          config(config) {
+        std::memcpy(this->seed.data(), seed, 32);
+    }
+
+    void Execute() override {
+        contextId = ContextManager::getInstance().createContext(seed.data(), config);
+        if (contextId == 0) {
+            SetError("Failed to initialize RandomX context");
+        }
+    }
+
+    void OnOK() override {
+        deferred.Resolve(Napi::Number::New(Env(), contextId));
+    }
+
+    void OnError(const Napi::Error& error) override {
+        deferred.Reject(error.Value());
+    }
+
+    Napi::Promise GetPromise() const {
+        return deferred.Promise();
+    }
+
+private:
+    Napi::Promise::Deferred deferred;
+    std::array<uint8_t, 32> seed = {};
+    RandomXConfig config;
+    uint32_t contextId = 0;
+};
+
 class HashAsyncWorker : public Napi::AsyncWorker {
 public:
     HashAsyncWorker(
@@ -91,37 +171,9 @@ Napi::Value InitContext(const Napi::CallbackInfo& info) {
         return env.Null();
     }
 
-    // Parse configuration options
     RandomXConfig config = {};
-    config.enableJit = true;
-    config.enableAes = true;
-    config.enableHugePages = false;  // Default to false for light mode
-    config.threads = 1;
-    config.mode = RandomXMode::LIGHT;  // Default to light mode for verification
-
-    if (info.Length() > 1 && info[1].IsObject()) {
-        Napi::Object options = info[1].As<Napi::Object>();
-
-        if (options.Has("enableJit")) {
-            config.enableJit = options.Get("enableJit").As<Napi::Boolean>().Value();
-        }
-        if (options.Has("enableAes")) {
-            config.enableAes = options.Get("enableAes").As<Napi::Boolean>().Value();
-        }
-        if (options.Has("enableHugePages")) {
-            config.enableHugePages = options.Get("enableHugePages").As<Napi::Boolean>().Value();
-        }
-        if (options.Has("threads")) {
-            config.threads = options.Get("threads").As<Napi::Number>().Uint32Value();
-        }
-        if (options.Has("mode")) {
-            std::string mode = options.Get("mode").As<Napi::String>().Utf8Value();
-            if (mode == "fast") {
-                config.mode = RandomXMode::FAST;
-            } else if (mode == "light") {
-                config.mode = RandomXMode::LIGHT;
-            }
-        }
+    if (info.Length() > 1 && !parseConfigFromValue(env, info[1], config)) {
+        return env.Null();
     }
 
     uint32_t contextId = ContextManager::getInstance().createContext(seedBuffer.Data(), config);
@@ -130,6 +182,31 @@ Napi::Value InitContext(const Napi::CallbackInfo& info) {
         return env.Null();
     }
     return Napi::Number::New(env, contextId);
+}
+
+Napi::Value InitContextAsync(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 1 || !info[0].IsBuffer()) {
+        Napi::TypeError::New(env, "First argument must be a 32-byte seed Buffer").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    Napi::Buffer<uint8_t> seedBuffer = info[0].As<Napi::Buffer<uint8_t>>();
+    if (seedBuffer.Length() != 32) {
+        Napi::TypeError::New(env, "Seed must be exactly 32 bytes").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    RandomXConfig config = {};
+    if (info.Length() > 1 && !parseConfigFromValue(env, info[1], config)) {
+        return env.Null();
+    }
+
+    auto* worker = new InitContextAsyncWorker(env, seedBuffer.Data(), config);
+    auto promise = worker->GetPromise();
+    worker->Queue();
+    return promise;
 }
 
 /**
@@ -335,6 +412,7 @@ Napi::Value GetHardwareInfo(const Napi::CallbackInfo& info) {
  */
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("initContext", Napi::Function::New(env, InitContext));
+    exports.Set("initContextAsync", Napi::Function::New(env, InitContextAsync));
     exports.Set("verifyShare", Napi::Function::New(env, VerifyShare));
     exports.Set("hash", Napi::Function::New(env, Hash));
     exports.Set("hashAsync", Napi::Function::New(env, HashAsync));

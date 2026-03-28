@@ -94,11 +94,11 @@ class MiningPool {
         if (difficulty > 1) {
             const leadingZeros = Math.floor(Math.log2(difficulty) / 8);
             for (let i = 0; i < Math.min(leadingZeros, 31); i++) {
-                target[i] = 0x00;
+                target[31 - i] = 0x00;
             }
 
             if (leadingZeros < 31) {
-                target[leadingZeros] = Math.floor(0xff / (difficulty / Math.pow(2, leadingZeros * 8)));
+                target[31 - leadingZeros] = Math.floor(0xff / (difficulty / Math.pow(2, leadingZeros * 8)));
             }
         }
 

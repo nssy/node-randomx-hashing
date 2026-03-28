@@ -27,7 +27,6 @@ bool ShareVerifier::verifyShare(
     ShareVerificationResult& result
 ) {
     result = {};
-    auto startTime = std::chrono::high_resolution_clock::now();
 
     // Get RandomX context
     auto context = ContextManager::getInstance().getContext(contextId);
@@ -35,8 +34,10 @@ bool ShareVerifier::verifyShare(
         return false;
     }
 
+    auto startTime = std::chrono::high_resolution_clock::now();
+
     // Calculate hash
-    if (!calculateHash(contextId, input, inputLength, result.hash)) {
+    if (!calculateHash(context, contextId, input, inputLength, result.hash)) {
         return false;
     }
 
@@ -72,6 +73,20 @@ bool ShareVerifier::calculateHash(
     uint8_t* output
 ) {
     auto context = ContextManager::getInstance().getContext(contextId);
+    if (!context || !context->vm) {
+        return false;
+    }
+
+    return calculateHash(context, contextId, input, inputLength, output);
+}
+
+bool ShareVerifier::calculateHash(
+    const std::shared_ptr<RandomXContext>& context,
+    uint32_t contextId,
+    const uint8_t* input,
+    size_t inputLength,
+    uint8_t* output
+) {
     if (!context || !context->vm) {
         return false;
     }

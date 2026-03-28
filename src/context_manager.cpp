@@ -272,11 +272,6 @@ HardwareInfo ContextManager::getHardwareInfo() const {
 void ContextManager::recordHash(uint32_t contextId, uint64_t elapsedMicros) {
     totalHashes.fetch_add(1);
     totalHashTimeMicros.fetch_add(elapsedMicros);
-
-    auto context = getContext(contextId);
-    if (context) {
-        context->hashCount.fetch_add(1);
-    }
 }
 
 /**
@@ -306,6 +301,7 @@ std::shared_ptr<RandomXSeedResources> ContextManager::acquireSeedResources(const
         if (it != seedResources.end()) {
             auto existing = it->second.lock();
             if (existing) {
+                cacheHits.fetch_add(1);
                 return existing;
             }
             seedResources.erase(it);
@@ -333,8 +329,10 @@ std::shared_ptr<RandomXSeedResources> ContextManager::acquireSeedResources(const
     memcpy(resources->seed, seed, 32);
     resources->config = config;
     resources->flags = getOptimalFlags(config);
-    resources->usedLargePages =
-        (static_cast<int>(resources->flags) & static_cast<int>(RANDOMX_FLAG_LARGE_PAGES)) != 0;
+    // RandomX does not expose whether huge-page allocation actually succeeded, so do not
+    // report requested flags as if they proved the final mapping used large pages.
+    resources->usedLargePages = false;
+    cacheMisses.fetch_add(1);
 
     resources->cache = randomx_alloc_cache(resources->flags);
     if (!resources->cache) {

@@ -8,6 +8,9 @@
 
 #include <cstdint>
 #include <chrono>
+#include <memory>
+
+struct RandomXContext;
 
 /**
  * Share verification result structure
@@ -29,7 +32,7 @@ public:
      * @param contextId RandomX context ID
      * @param input Input data to hash
      * @param inputLength Length of input data
-     * @param target Target difficulty (32 bytes)
+     * @param target Target difficulty (32 bytes, little-endian)
      * @param expectedHash Expected hash result (optional, 32 bytes)
      * @param result Output verification result
      * @return True if successful, false on error
@@ -58,6 +61,14 @@ public:
         uint8_t* output
     );
 
+    static bool calculateHash(
+        const std::shared_ptr<RandomXContext>& context,
+        uint32_t contextId,
+        const uint8_t* input,
+        size_t inputLength,
+        uint8_t* output
+    );
+
     /**
      * Calculate difficulty from hash
      * @param hash Hash to analyze (32 bytes)
@@ -68,7 +79,7 @@ public:
     /**
      * Check if hash meets target difficulty
      * @param hash Hash to check (32 bytes)
-     * @param target Target to compare against (32 bytes)
+     * @param target Target to compare against (32 bytes, little-endian)
      * @return True if hash meets target
      */
     static bool meetsTarget(const uint8_t* hash, const uint8_t* target);

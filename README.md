@@ -83,6 +83,7 @@ const seed = Buffer.alloc(32, 1);
 const input = Buffer.from('mining-share-data');
 const target = Buffer.alloc(32, 0xff);
 
+await pool.warmSeedAsync(seed);
 const result = pool.verifyShare(seed, input, target);
 console.log('Share valid:', result.valid);
 console.log('Hash time:', result.hashTime, 'ms');
@@ -114,6 +115,18 @@ For pool workloads, prefer `createSeedPool()` / `createPoolSeedPool()`.
 
 **Returns:** Context ID (number)
 
+### `initContextAsync(seed, options)`
+
+Low-level async API. Initialize a single RandomX VM context for a seed on libuv's worker pool.
+
+For pool workloads, prefer `createSeedPool()` / `createPoolSeedPool()`.
+
+**Parameters:**
+- `seed` (Buffer): 32-byte RandomX seed
+- `options` (Object): same options as `initContext`
+
+**Returns:** `Promise<number>`
+
 ### `createSeedPool(options)`
 
 Primary high-level API for pools and brokers.
@@ -140,6 +153,8 @@ Use this when your workload is specifically RandomX epoch based (current + previ
 Important methods:
 - `hash(seed, input)`
 - `hashAsync(seed, input)`
+- `warmSeed(seed)` / `warmSeedAsync(seed)`
+- `warmSeedFromHex(seedHex)` / `warmSeedAsyncFromHex(seedHex)`
 - `verifyShare(seed, input, target, expectedHash?)`
 - `hashFromHex(seedHex, input)`
 - `hashAsyncFromHex(seedHex, input)`
@@ -147,6 +162,11 @@ Important methods:
 - `getContext(seed)` / `getContextFromHex(seedHex)` for low-level interop
 - `release(seed)` / `releaseFromHex(seedHex)` / `releaseAll()`
 - `getSnapshot()`
+
+Notes:
+- `hashAsync()` and `hashAsyncFromHex()` are warmup-aware and will await any pending async warmup for that seed.
+- sync `hash()` / `verifyShare()` methods do not wait for pending async warmups and may still initialize synchronously.
+- `releaseAll()` is a full teardown; after calling it, the `SeedPool` instance should be considered disposed and will reject further use.
 
 ### `verifyShare(contextId, input, target, expectedHash?)`
 
@@ -157,7 +177,7 @@ Verify a mining share against difficulty target.
 **Parameters:**
 - `contextId` (number): Context ID from `initContext`
 - `input` (Buffer): Share data to hash
-- `target` (Buffer): 32-byte difficulty target
+- `target` (Buffer): 32-byte difficulty target, little-endian
 - `expectedHash` (Buffer, optional): Expected hash for validation
 
 **Returns:** Object with:
@@ -238,7 +258,7 @@ The build system is local-source based and builds from the vendored `deps/random
 
 The build system automatically applies optimal settings:
 
-- **Compiler Flags**: `-O3 -march=native -mtune=native -ffast-math`
+- **Compiler Flags**: `-O3 -march=native -mtune=native`
 - **RandomX Features**: JIT compilation + AES acceleration enabled
 - **Cross-Platform**: Handles Linux, Windows, and macOS differences
 - **Dependencies**: Automatically manages pthread and native build inputs
@@ -313,6 +333,7 @@ For real pool deployments, a useful pattern is:
 - keep RandomX in one or a few broker processes
 - let pool workers send hash requests over a local socket
 - use `createPoolSeedPool({ maxSeeds: 2, vmPoolSize: N, mode: 'fast' })`
+- call `seedPool.warmSeedAsync(seed)` when a new `seed_hash` appears so dataset init happens off the main thread
 - call `seedPool.hashAsync(seed, input)` inside the broker so one process can overlap requests
 
 See:
@@ -385,6 +406,7 @@ brew install cmake          # macOS
 - This is normal and doesn't affect functionality
 - Large pages are off unless explicitly requested
 - For pool brokers, start with `enableHugePages: false` and only enable after verifying the host can satisfy allocation reliably
+- `getContextInfo(contextId).usedLargePages` is conservative; it stays `false` unless the addon can prove large-page backing
 
 ### Build Verification
 

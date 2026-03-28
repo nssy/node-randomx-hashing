@@ -47,6 +47,14 @@ function initContext(seed, options = {}) {
     return randomx.initContext(seed, normalizeInitOptions(options));
 }
 
+function initContextAsync(seed, options = {}) {
+    if (!Buffer.isBuffer(seed) || seed.length !== 32) {
+        throw new Error('Seed must be a 32-byte Buffer');
+    }
+
+    return randomx.initContextAsync(seed, normalizeInitOptions(options));
+}
+
 /**
  * LRU seed pool keyed by 32-byte seed. Each seed entry owns one shared cache/dataset
  * plus a small VM pool.
@@ -66,8 +74,18 @@ class SeedPool {
         this._vmPoolSize = Math.max(1, Number(vmPoolSize) || 1);
         /** @type {Map<string, { contextIds: number[], lastUsed: number, nextIndex: number }>} */
         this._lru = new Map();
+        this._pendingWarmups = new Map();
+        this._destroyed = false;
         this._idleEvictMs =
             idleEvictMs != null && Number(idleEvictMs) > 0 ? Number(idleEvictMs) : null;
+    }
+
+    _cancelPendingWarmup(key) {
+        const pending = this._pendingWarmups.get(key);
+        if (pending) {
+            pending.cancelled = true;
+            this._pendingWarmups.delete(key);
+        }
     }
 
     _expireIdleContexts() {
@@ -101,6 +119,9 @@ class SeedPool {
      */
     getContext(seed) {
         this._assertSeed(seed);
+        if (this._destroyed) {
+            throw new Error('SeedPool has been released');
+        }
         const key = seed.toString('hex');
 
         this._expireIdleContexts();
@@ -126,8 +147,15 @@ class SeedPool {
         }
 
         const contextIds = [];
-        for (let i = 0; i < this._vmPoolSize; i++) {
-            contextIds.push(randomx.initContext(seed, normalizeInitOptions(this._initOptions)));
+        try {
+            for (let i = 0; i < this._vmPoolSize; i++) {
+                contextIds.push(randomx.initContext(seed, normalizeInitOptions(this._initOptions)));
+            }
+        } catch (error) {
+            for (const contextId of contextIds) {
+                randomx.releaseContext(contextId);
+            }
+            throw error;
         }
         // lastUsed after init: init can take >> idleEvictMs; pre-init timestamps wrongly evict "stale" entries
         this._lru.set(key, { contextIds, lastUsed: Date.now(), nextIndex: 1 % contextIds.length });
@@ -135,6 +163,19 @@ class SeedPool {
     }
 
     _getContextForSeed(seed) {
+        return this.getContext(seed);
+    }
+
+    async _getContextForSeedAsync(seed) {
+        this._assertSeed(seed);
+        const key = seed.toString('hex');
+        const pending = this._pendingWarmups.get(key);
+        if (pending) {
+            await pending.promise;
+        }
+        if (this._destroyed) {
+            throw new Error('SeedPool has been released');
+        }
         return this.getContext(seed);
     }
 
@@ -158,6 +199,7 @@ class SeedPool {
             throw new Error('Input must be a Buffer');
         }
 
+        // Sync hashing does not wait for pending async warmups and may initialize synchronously.
         return randomx.hash(this._getContextForSeed(seed), input);
     }
 
@@ -171,15 +213,113 @@ class SeedPool {
             throw new Error('Input must be a Buffer');
         }
 
-        return randomx.hashAsync(this._getContextForSeed(seed), input);
+        return this._getContextForSeedAsync(seed).then((contextId) => randomx.hashAsync(contextId, input));
     }
 
     hashAsyncFromHex(seedHex, input) {
+        if (typeof seedHex !== 'string' || seedHex.length !== 64) {
+            throw new Error('seedHex must be a 64-character hex string (32 bytes)');
+        }
+        if (!/^[0-9a-fA-F]+$/.test(seedHex)) {
+            throw new Error('seedHex must be hexadecimal');
+        }
         if (!Buffer.isBuffer(input)) {
             throw new Error('Input must be a Buffer');
         }
 
-        return randomx.hashAsync(this.getContextFromHex(seedHex), input);
+        return this._getContextForSeedAsync(Buffer.from(seedHex, 'hex'))
+            .then((contextId) => randomx.hashAsync(contextId, input));
+    }
+
+    warmSeed(seed) {
+        this._assertSeed(seed);
+        this.getContext(seed);
+    }
+
+    warmSeedFromHex(seedHex) {
+        this.getContextFromHex(seedHex);
+    }
+
+    async warmSeedAsync(seed) {
+        this._assertSeed(seed);
+        const seedCopy = Buffer.from(seed);
+        const key = seedCopy.toString('hex');
+
+        this._expireIdleContexts();
+
+        if (this._lru.has(key)) {
+            const entry = this._lru.get(key);
+            entry.lastUsed = Date.now();
+            return;
+        }
+
+        if (this._pendingWarmups.has(key)) {
+            return this._pendingWarmups.get(key).promise;
+        }
+
+        const pending = {
+            cancelled: false,
+            promise: null
+        };
+
+        const warmup = (async () => {
+            const contextIds = [];
+            try {
+                for (let i = 0; i < this._vmPoolSize; i++) {
+                    contextIds.push(await initContextAsync(seedCopy, this._initOptions));
+                    if (pending.cancelled) {
+                        for (const contextId of contextIds) {
+                            randomx.releaseContext(contextId);
+                        }
+                        return;
+                    }
+                }
+
+                if (this._lru.has(key)) {
+                    for (const contextId of contextIds) {
+                        randomx.releaseContext(contextId);
+                    }
+                    const entry = this._lru.get(key);
+                    entry.lastUsed = Date.now();
+                    return;
+                }
+
+                if (this._lru.size >= this.maxSeeds) {
+                    const evictKey = this._lru.keys().next().value;
+                    const evictEntry = this._lru.get(evictKey);
+                    this._lru.delete(evictKey);
+                    for (const contextId of evictEntry.contextIds) {
+                        randomx.releaseContext(contextId);
+                    }
+                }
+
+                this._lru.set(key, { contextIds, lastUsed: Date.now(), nextIndex: 1 % contextIds.length });
+            } catch (error) {
+                for (const contextId of contextIds) {
+                    randomx.releaseContext(contextId);
+                }
+                throw error;
+            } finally {
+                const current = this._pendingWarmups.get(key);
+                if (current === pending) {
+                    this._pendingWarmups.delete(key);
+                }
+            }
+        })();
+
+        pending.promise = warmup;
+        this._pendingWarmups.set(key, pending);
+        return warmup;
+    }
+
+    async warmSeedAsyncFromHex(seedHex) {
+        if (typeof seedHex !== 'string' || seedHex.length !== 64) {
+            throw new Error('seedHex must be a 64-character hex string (32 bytes)');
+        }
+        if (!/^[0-9a-fA-F]+$/.test(seedHex)) {
+            throw new Error('seedHex must be hexadecimal');
+        }
+        return this.warmSeedAsync(Buffer.from(seedHex, 'hex'));
     }
 
     verifyShare(seed, input, target, expectedHash = null) {
@@ -187,6 +327,7 @@ class SeedPool {
         if (!Buffer.isBuffer(input)) {
             throw new Error('Input must be a Buffer');
         }
+        // Sync verification does not wait for pending async warmups and may initialize synchronously.
         return randomx.verifyShare(this._getContextForSeed(seed), input, target, expectedHash);
     }
 
@@ -214,6 +355,7 @@ class SeedPool {
     release(seed) {
         this._assertSeed(seed);
         const key = seed.toString('hex');
+        this._cancelPendingWarmup(key);
         if (!this._lru.has(key)) {
             return false;
         }
@@ -237,6 +379,10 @@ class SeedPool {
     }
 
     releaseAll() {
+        this._destroyed = true;
+        for (const key of this._pendingWarmups.keys()) {
+            this._cancelPendingWarmup(key);
+        }
         for (const entry of this._lru.values()) {
             for (const contextId of entry.contextIds) {
                 randomx.releaseContext(contextId);
@@ -383,6 +529,7 @@ function releaseContext(contextId) {
  * Snapshot of how this context was built (for logging / tests).
  * @param {number} contextId
  * @returns {{ mode: string, enableHugePages: boolean, usedLargePages: boolean } | null} null if invalid id
+ * `usedLargePages` is conservative; it is false unless the addon can prove large-page backing.
  */
 function getContextInfo(contextId) {
     if (typeof contextId !== 'number') {
@@ -412,6 +559,7 @@ function getHardwareInfo() {
 
 module.exports = {
     initContext,
+    initContextAsync,
     normalizeInitOptions,
     createSeedPool,
     createPoolSeedPool,

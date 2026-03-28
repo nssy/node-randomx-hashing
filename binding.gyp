@@ -78,7 +78,6 @@
         "-O3",
         "-march=native",
         "-mtune=native",
-        "-ffast-math",
         "-funroll-loops"
       ],
       "libraries": [
