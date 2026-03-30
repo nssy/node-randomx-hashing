@@ -97,7 +97,7 @@ async function runTests() {
         console.log('Stats:', stats);
         assert(typeof stats.totalHashes === 'number', 'Total hashes should be number');
         assert(typeof stats.totalVerifications === 'number', 'Total verifications should be number');
-        assert(typeof stats.activeContexts === 'number', 'Active contexts should be number');
+        assert(typeof stats.activeVMs === 'number', 'Active VMs should be number');
         assert(stats.totalHashes >= iterations, 'Should have recorded hash operations');
         console.log('✓ Statistics test passed\n');
 
@@ -169,7 +169,7 @@ async function runTests() {
         // Test 10: Context cache (LRU, light mode to keep tests fast)
         console.log('Test 10: Context cache LRU');
         const rxCache = randomx.createContextCache({
-            maxContexts: 1,
+            maxSeeds: 1,
             mode: 'light',
             threads: 1,
             enableHugePages: false
@@ -201,14 +201,14 @@ async function runTests() {
         assert(rxCache.size === 0, 'releaseAll empties cache');
 
         const epoch = randomx.createPoolEpochCache({ mode: 'light', threads: 1 });
-        assert(epoch.maxContexts === 2, 'createPoolEpochCache defaults maxContexts to 2');
+        assert(epoch.maxSeeds === 2, 'createPoolEpochCache defaults maxSeeds to 2');
         epoch.releaseAll();
         console.log('✓ Context cache test passed\n');
 
         // Test 10b: Idle eviction — drop unused seed contexts after a grace period (saves RAM in pools)
         console.log('Test 10b: Context cache idle eviction');
         const idleRx = randomx.createContextCache({
-            maxContexts: 2,
+            maxSeeds: 2,
             mode: 'light',
             threads: 1,
             enableHugePages: false,
@@ -299,7 +299,7 @@ async function runTests() {
     console.log('\nFinal Statistics:');
     console.log(`- Total hashes: ${finalStats.totalHashes}`);
     console.log(`- Total verifications: ${finalStats.totalVerifications}`);
-    console.log(`- Active contexts: ${finalStats.activeContexts}`);
+    console.log(`- Active VMs: ${finalStats.activeVMs}`);
     console.log(`- Average hash time: ${finalStats.averageHashTime.toFixed(3)} ms`);
 }
 

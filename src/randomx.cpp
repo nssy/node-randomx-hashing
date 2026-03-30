@@ -352,7 +352,7 @@ Napi::Value GetStats(const Napi::CallbackInfo& info) {
     Napi::Object statsObj = Napi::Object::New(env);
     statsObj.Set("totalHashes", Napi::Number::New(env, stats.totalHashes));
     statsObj.Set("totalVerifications", Napi::Number::New(env, stats.totalVerifications));
-    statsObj.Set("activeContexts", Napi::Number::New(env, stats.activeContexts));
+    statsObj.Set("activeVMs", Napi::Number::New(env, stats.activeContexts));
     statsObj.Set("activeSeeds", Napi::Number::New(env, stats.activeSeeds));
     statsObj.Set("averageHashTime", Napi::Number::New(env, stats.averageHashTime));
     statsObj.Set("cacheHits", Napi::Number::New(env, stats.cacheHits));

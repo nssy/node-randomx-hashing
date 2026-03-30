@@ -128,7 +128,7 @@ function startBroker() {
         const stats = randomx.getStats();
         console.log('RandomX stats:', {
             totalHashes: stats.totalHashes,
-            activeContexts: stats.activeContexts,
+            activeVMs: stats.activeVMs,
             activeSeeds: stats.activeSeeds,
             averageHashTime: Number(stats.averageHashTime || 0).toFixed(3),
             cacheSnapshot: rxCache.getSnapshot()

@@ -225,7 +225,7 @@ Get performance statistics.
 **Returns:** Object with:
 - `totalHashes` (number): Total hashes calculated
 - `totalVerifications` (number): Total shares verified
-- `activeContexts` (number): Active context count
+- `activeVMs` (number): Active VM count
 - `activeSeeds` (number): Active shared seed-resource count
 - `averageHashTime` (number): Average hash time in ms
 - `cacheHits` (number): Context cache hits

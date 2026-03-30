@@ -425,10 +425,7 @@ class SeedPool {
  * @returns {SeedPool}
  */
 function createSeedPool(options = {}) {
-    const maxSeeds =
-        options.maxSeeds != null ? Number(options.maxSeeds) : (
-            options.maxContexts != null ? Number(options.maxContexts) : 2
-        );
+    const maxSeeds = options.maxSeeds != null ? Number(options.maxSeeds) : 2;
     if (!Number.isFinite(maxSeeds) || maxSeeds < 1) {
         throw new Error('maxSeeds must be a positive number');
     }
@@ -438,7 +435,7 @@ function createSeedPool(options = {}) {
         throw new Error('vmPoolSize must be a positive number');
     }
 
-    const { maxSeeds: _ms, maxContexts: _mc, idleEvictMs, vmPoolSize: _vp, ...rest } = options;
+    const { maxSeeds: _ms, idleEvictMs, vmPoolSize: _vp, ...rest } = options;
     const initOptions = {
         mode: 'light',
         threads: Math.max(1, os.cpus().length),
@@ -461,9 +458,7 @@ function createSeedPool(options = {}) {
  * @returns {SeedPool}
  */
 function createPoolSeedPool(options = {}) {
-    const max = options.maxSeeds != null ? options.maxSeeds : (
-        options.maxContexts != null ? options.maxContexts : 2
-    );
+    const max = options.maxSeeds != null ? options.maxSeeds : 2;
     return createSeedPool({ ...options, maxSeeds: max });
 }
 
