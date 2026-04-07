@@ -69,11 +69,15 @@ ContextManager::ContextManager()
  * Destructor
  */
 ContextManager::~ContextManager() {
-    std::lock_guard<std::mutex> lock(contextsMutex);
-    contexts.clear();
-    std::lock_guard<std::mutex> seedLock(seedResourcesMutex);
-    seedResources.clear();
-    seedInitStates.clear();
+    {
+        std::lock_guard<std::mutex> seedLock(seedResourcesMutex);
+        seedResources.clear();
+        seedInitStates.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(contextsMutex);
+        contexts.clear();
+    }
 }
 
 randomx_flags ContextManager::getOptimalFlags(const RandomXConfig& config) {

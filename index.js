@@ -13,12 +13,12 @@ const randomx = require('./build/Release/randomx');
  */
 function normalizeInitOptions(options = {}) {
     const config = {
+        ...options,
         enableJit: options.enableJit !== false,
         enableAes: options.enableAes !== false,
         enableHugePages: options.enableHugePages === true,
         threads: options.threads || 1,
-        mode: options.mode || 'light',
-        ...options
+        mode: options.mode || 'light'
     };
 
     if (typeof config.mode !== 'string' || !['light', 'fast'].includes(config.mode)) {

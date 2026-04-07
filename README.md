@@ -166,6 +166,7 @@ Important methods:
 Notes:
 - `hashAsync()` and `hashAsyncFromHex()` are warmup-aware and will await any pending async warmup for that seed.
 - sync `hash()` / `verifyShare()` methods do not wait for pending async warmups and may still initialize synchronously.
+- in `fast` mode, a cold sync `hash()` / `verifyShare()` can block the Node.js event loop during dataset initialization; prefer `warmSeedAsync()` first, then use async APIs or only call sync APIs once the seed is known hot.
 - `releaseAll()` is a full teardown; after calling it, the `SeedPool` instance should be considered disposed and will reject further use.
 
 ### `verifyShare(contextId, input, target, expectedHash?)`
