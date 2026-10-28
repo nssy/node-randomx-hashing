@@ -23,7 +23,8 @@ That maps much better to real pool workloads than making application code manage
 
 - **JIT Compilation**: Near-native speed RandomX execution
 - **AES Hardware**: Hardware-accelerated AES when available
-- **Memory Optimization**: Shared seed resources and optional large pages
+- **Memory Optimization**: Shared seed resources; huge pages by default with automatic fallback
+- **RandomX v2 ready**: `rx/0` and `rx/2` per call, sharing one dataset per seed
 - **Seed Reuse**: Current/previous `seed_hash` values stay warm without rebuilding full datasets
 - **Async Hashing**: `hashAsync()` lets Node brokers overlap requests without blocking the event loop
 
@@ -68,181 +69,193 @@ npm install
 ## Quick Start
 
 ```javascript
-const randomx = require('node-randomx-hashing');
+const randomx = require('randomx-hashing');
 
 // Primary API: a seed pool for current + previous seed_hash
 const pool = randomx.createPoolSeedPool({
     maxSeeds: 2,
-    vmPoolSize: 2,
-    mode: 'fast',           // explicit: fast is never implied by magic
-    threads: 4,             // dataset init threads
-    enableHugePages: false
+    vmPoolSize: 2,          // max concurrent VMs per variant per seed
+    mode: 'fast',           // explicit: fast is never implied
+    threads: 4              // dataset init threads
+    // huge pages are on by default, with fallback; pass enableHugePages: false to opt out
 });
 
 const seed = Buffer.alloc(32, 1);
-const input = Buffer.from('mining-share-data');
-const target = Buffer.alloc(32, 0xff);
+const blob = Buffer.from('hashing blob with nonce');
 
 await pool.warmSeedAsync(seed);
-const result = pool.verifyShare(seed, input, target);
-console.log('Share valid:', result.valid);
-console.log('Hash time:', result.hashTime, 'ms');
 
-// Async hashing, useful for broker/server patterns
-const hash = await pool.hashAsync(seed, input);
-console.log('Hash:', hash.toString('hex'));
+// Pick the variant per job from the block major version (Monero v17+ = RandomX v2)
+const variant = randomx.getVariant(blob);
 
-// Clean up when done
+// `pow` is what must meet the target (and what miners submit as `result`):
+// the hash for rx/0, the commitment for rx/2
+const { hash, pow } = await pool.powAsync(seed, blob, { variant });
+console.log(variant, 'hash:', hash.toString('hex'), 'pow:', pow.toString('hex'));
+
+console.log('memory:', pool.getMemoryInfo(seed)); // e.g. { dataset: 'hugetlb', cache: null, ... } (fast mode frees the cache)
+
 pool.releaseAll();
 ```
 
+## RandomX v2 (`rx/2`)
+
+Monero's hard fork 17 (FCMP++) switches PoW to RandomX v2. No activation height is announced yet,
+and nothing here needs one: the variant comes from each job's hashing blob.
+
+- **Variants** are named like the stratum `algo` strings: `'rx/0'` (default) and `'rx/2'`. Every
+  hash call takes `{ variant }`; an unknown variant throws instead of falling back.
+- **One dataset serves both variants.** `RANDOMX_FLAG_V2` only changes the VM, so a fork in the
+  middle of a seed epoch needs no second dataset. Each variant gets its own VM pool, created on
+  first use.
+- **PoW vs hash:** for rx/2 the value compared with the target is the commitment
+  `Blake2b-256(blob || hash)`, available as `pow` from `pow()` / `powAsync()` and via
+  `commitment(input, hash)`. `verifyShare()` computes difficulty from `pow`.
+- **xmrig's submit fields are swapped:** `result` is the commitment (`pow`), and `commitment` is
+  the raw RandomX hash. `commitment(blob, params.commitment).equals(result)` is a cheap
+  pre-check before the full hash.
+- **`getVariant(blob)`**: `'rx/2'` when the block major version is 17 or higher.
+- **`capabilities()`**: `{ abi, variants, commitment, randomx }`. Assert `variants.includes('rx/2')`
+  at startup so a stale build fails loudly instead of returning v1 hashes. `randomx` is the
+  upstream RandomX commit the addon was compiled from; log it at startup.
+
+## Memory and huge pages
+
+Huge pages are **on by default** and every buffer falls back on its own:
+
+| Buffer | Tried in order |
+|---|---|
+| Dataset (fast mode, ~2 GiB) | reserved hugetlb pages → transparent huge pages → normal pages |
+| Cache (~256 MiB; freed after dataset init in fast mode) | reserved hugetlb pages → transparent huge pages → normal pages |
+| VM scratchpad (2 MiB per VM) | reserved hugetlb pages → normal pages |
+
+- **Scratchpads never use transparent huge pages.** RandomX allocates them itself (2 MiB, not
+  2 MiB-aligned), so THP can't back them whatever the THP mode: they are on reserved pages
+  (one per VM) or normal pages. The cost is small: ≤4% per hash measured on Zen 2, against ~15%
+  for the dataset.
+- **Reserved hugetlb pages** are used only when the kernel's default huge page size is 2 MiB and
+  enough pages are available (free minus reserved). 1 GiB pages are never used.
+- **Transparent huge pages** are requested with `madvise(MADV_HUGEPAGE)` before the memory is
+  first touched, when THP is `always` or `madvise`.
+- `enableHugePages: 'thp'` uses transparent huge pages only and leaves the reserved pool to other
+  processes (e.g. a miner or monerod on the same host). `enableHugePages: false` uses normal pages.
+- **What was used is recorded once** when each buffer is allocated: `'hugetlb'`, `'thp'` or
+  `'normal'`. See `getContextInfo(id).memory`, `SeedPool.getMemoryInfo(seed)`,
+  `SeedPool.getSnapshot()` and `getStats().memory`. Reserved hugetlb pages do not count towards
+  RSS.
+
+Measured on a Zen 2 host (fast mode, single thread): ~1.73 ms/hash on normal pages, ~1.5 ms with
+transparent or reserved huge pages.
+
+### Sizing the reserved pool
+
+Callers don't need to choose anything: leave `enableHugePages` unset and size the host. Per
+process, in 2 MiB pages:
+
+| Per seed | Pages |
+|---|---|
+| Fast mode (dataset) | 1,040 + 1 per VM |
+| Light mode (cache) | 128 + 1 per VM |
+
+VMs are created on demand, up to `vmPoolSize` per variant, so a seed hashed with both rx/0 and
+rx/2 can reach `2 × vmPoolSize` VMs. Multiply by `maxSeeds` (2 during an epoch switch) and by the
+number of processes that load the addon. Example: one fast broker with `vmPoolSize: 16` and
+`maxSeeds: 2` needs at most 2 × (1,040 + 32) = 2,144 pages (4.2 GiB).
+
+When the pool runs short, buffers land on transparent huge pages, or on normal pages, and keep
+working. Log `getMemoryInfo(seed)` once per seed to see which (`examples/memory-backing.js`).
+
 ## API Reference
 
-### `initContext(seed, options)`
+### `createSeedPool(options)` / `createPoolSeedPool(options)`
 
-Low-level API. Initialize a single RandomX VM context for a seed.
+Primary high-level API for pools and brokers. `createPoolSeedPool` defaults `maxSeeds` to 2
+(current + previous seed).
 
-For pool workloads, prefer `createSeedPool()` / `createPoolSeedPool()`.
+Count options must be positive integers: other numbers (`NaN`, `±Infinity`, fractions, `0`,
+negatives) and other types throw a `RangeError`. Values above a cap are lowered to it with a
+one-time `RANDOMX_HASHING_CAPPED` process warning; past these, a setting costs memory or threads
+without helping. The caps are exported as `LIMITS`. Context ids must be exact: `1.5` or `2**32 + 1`
+never resolve to context 1.
 
-**Parameters:**
-- `seed` (Buffer): 32-byte RandomX seed
-- `options` (Object): Configuration options
-  - `mode` (string): `"light"` or `"fast"` (default: `"light"`)
-  - `enableJit` (boolean): Enable JIT compilation (default: true)
-  - `enableAes` (boolean): Enable AES acceleration (default: true)
-  - `enableHugePages` (boolean): Enable large pages (default: false)
-  - `threads` (number): Initialization threads (default: 1)
-
-**Returns:** Context ID (number)
-
-### `initContextAsync(seed, options)`
-
-Low-level async API. Initialize a single RandomX VM context for a seed on libuv's worker pool.
-
-For pool workloads, prefer `createSeedPool()` / `createPoolSeedPool()`.
-
-**Parameters:**
-- `seed` (Buffer): 32-byte RandomX seed
-- `options` (Object): same options as `initContext`
-
-**Returns:** `Promise<number>`
-
-### `createSeedPool(options)`
-
-Primary high-level API for pools and brokers.
-
-**Parameters:**
-- `options.maxSeeds` (number, default `2`): how many different seeds to retain
-- `options.vmPoolSize` (number, default `1`): how many VMs to create per seed
-- `options.mode` (string, default `"light"`): `"light"` or `"fast"`
-- `options.threads` (number, default `os.cpus().length`): dataset init threads
-- `options.enableJit` (boolean)
-- `options.enableAes` (boolean)
-- `options.enableHugePages` (boolean)
-- `options.idleEvictMs` (number): evict idle seeds after this many ms
+**Options:**
+- `maxSeeds` (integer, default `2`, capped at 4): how many seeds to retain (LRU)
+- `vmPoolSize` (integer, default `1`, capped at the CPU count): max VMs per variant per seed; any idle VM serves a request
+- `mode` (string, default `"light"`): `"light"` or `"fast"`. Omitted or falsy values select
+  `"light"`; use `mode: "fast"` explicitly for the full-memory mode.
+- `threads` (integer, default half the CPUs, capped at the CPU count): dataset init threads; leaves cores for live hashing during a seed change
+- `enableJit`, `enableAes` (boolean, default `true`)
+- `enableHugePages` (`true` | `'thp'` | `false`, default `true`): see [Memory and huge pages](#memory-and-huge-pages)
+- `idleEvictMs` (number of ms; unset or `0` disables): release seeds not hashed for this many ms, checked on a timer (memory is freed without traffic). A seed that was only warmed is kept until its first hash (or LRU displacement), so prewarming `next_seed_hash` ~2 h before the epoch switch survives a shorter idle window
 
 **Returns:** `SeedPool`
 
-### `createPoolSeedPool(options)`
-
-Convenience wrapper around `createSeedPool()` with the same semantics.
-Use this when your workload is specifically RandomX epoch based (current + previous seed).
-
 ### `SeedPool`
 
-Important methods:
-- `hash(seed, input)`
-- `hashAsync(seed, input)`
-- `warmSeed(seed)` / `warmSeedAsync(seed)`
-- `warmSeedFromHex(seedHex)` / `warmSeedAsyncFromHex(seedHex)`
-- `verifyShare(seed, input, target, expectedHash?)`
-- `hashFromHex(seedHex, input)`
-- `hashAsyncFromHex(seedHex, input)`
-- `verifyShareFromHex(seedHex, input, target, expectedHash?)`
-- `getContext(seed)` / `getContextFromHex(seedHex)` for low-level interop
+All hashing methods take an optional `{ variant }` (default `'rx/0'`). Every method that takes a
+seed also has a `...FromHex(seedHex, ...)` form, except `has` and `getMemoryInfo`.
+- `hashAsync(seed, input, options?)` → `Promise<Buffer>`: raw hash
+- `powAsync(seed, input, options?)` → `Promise<{ hash, pow }>`
+- `hash(seed, input, options?)` / `pow(seed, input, options?)`: sync forms
+- `verifyShare(seed, input, target, expectedPow?, options?)`: sync
+- `warmSeedAsync(seed)` / `warmSeed(seed)`: build a seed's cache/dataset (variants need no warmup)
+- `getMemoryInfo(seed)`, `getSnapshot()`, `has(seed)`, `size`
+- `getContext(seed)` / `getContextFromHex(seedHex)`: context id for the low-level API
 - `release(seed)` / `releaseFromHex(seedHex)` / `releaseAll()`
-- `getSnapshot()`
 
 Notes:
-- `hashAsync()` and `hashAsyncFromHex()` are warmup-aware and will await any pending async warmup for that seed.
-- sync `hash()` / `verifyShare()` methods do not wait for pending async warmups and may still initialize synchronously.
-- in `fast` mode, a cold sync `hash()` / `verifyShare()` can block the Node.js event loop during dataset initialization; prefer `warmSeedAsync()` first, then use async APIs or only call sync APIs once the seed is known hot.
-- `releaseAll()` is a full teardown; after calling it, the `SeedPool` instance should be considered disposed and will reject further use.
+- Async methods never block the event loop: a missing seed is warmed on the worker pool first,
+  and concurrent requests for one seed share a single build.
+- Sync methods initialize a missing seed synchronously; in fast mode that blocks the event loop
+  for the dataset build. Warm first or use the async methods.
+- Sync methods also wait for a free VM when all `vmPoolSize` VMs of that variant are busy with
+  async work.
+- Releasing or evicting a seed never breaks hashes already in flight, including a hash queued
+  in the same tick as the release.
+- `releaseAll()` is a full teardown; the pool rejects further use.
+- **Concurrency is bounded by libuv's thread pool**, 4 threads by default. Async hashes and
+  warmups run there, so `vmPoolSize: 16` with the default pool hashes only 4 at a time. Set
+  `UV_THREADPOOL_SIZE` to at least `vmPoolSize + 2` in the environment of the process before it
+  starts: a warmup holds one thread for the whole dataset build, and the current and next seed
+  can warm at once.
+- Errors: invalid arguments (types, sizes, variants, count options) throw synchronously, even
+  from async methods. A released pool and failed allocations reject.
+- When memory runs out, a seed that can't be allocated fails with "Failed to initialize RandomX
+  context", and a VM pool that can't add a VM keeps using the VMs it already has. The process is
+  never aborted.
 
-### `verifyShare(contextId, input, target, expectedHash?)`
+### Low-level API (context ids)
 
-Low-level API for raw context ids.
+A context is one seed: its cache/dataset plus VM pools per variant.
 
-Verify a mining share against difficulty target.
+- `initContext(seed, options)` / `initContextAsync(seed, options)` → context id. Same options as
+  `createSeedPool` (`mode`, `enableJit`, `enableAes`, `enableHugePages`, `threads`, `vmPoolSize`;
+  defaults `light`, true, true, true, 1, 1).
+- `hash(id, input, options?)` / `hashAsync(id, input, options?)` → raw hash
+- `pow(id, input, options?)` / `powAsync(id, input, options?)` → `{ hash, pow }`
+- `verifyShare(id, input, target, expectedPow?, options?)` → `{ valid, difficulty, hash, pow, hashTime }`.
+  `valid` means `pow <= target` (32-byte little-endian) and, if given, `pow` equals `expectedPow`;
+  `difficulty` is `2^256 / pow`.
+- `commitment(input, hash)` → `Blake2b-256(input || hash)`
+- `releaseContext(id)`
+- `getContextInfo(id)` → `{ mode, enableHugePages, hugePages, vmPoolSize, vms: { 'rx/0', 'rx/2' }, memory: { dataset, cache, scratchpad: { hugetlb, normal } } }` or `null`
 
-**Parameters:**
-- `contextId` (number): Context ID from `initContext`
-- `input` (Buffer): Share data to hash
-- `target` (Buffer): 32-byte difficulty target, little-endian
-- `expectedHash` (Buffer, optional): Expected hash for validation
+### Info
 
-**Returns:** Object with:
-- `valid` (boolean): Whether share meets target
-- `difficulty` (number): Calculated difficulty
-- `hash` (Buffer): 32-byte RandomX hash
-- `hashTime` (number): Hash calculation time in ms
-
-### `hash(contextId, input)`
-
-Low-level API for raw context ids.
-
-Calculate RandomX hash for given input.
-
-**Parameters:**
-- `contextId` (number): Context ID from `initContext`
-- `input` (Buffer): Data to hash
-
-**Returns:** 32-byte hash (Buffer)
-
-### `hashAsync(contextId, input)`
-
-Calculate RandomX hash asynchronously on libuv's worker pool.
-
-This is the preferred primitive for Node.js broker/server patterns where one process
-handles many concurrent requests against a shared set of RandomX VMs.
-
-**Parameters:**
-- `contextId` (number): Context ID from `initContext`
-- `input` (Buffer): Data to hash
-
-**Returns:** `Promise<Buffer>`
-
-### `releaseContext(contextId)`
-
-Release a RandomX context and free memory.
-
-**Parameters:**
-- `contextId` (number): Context ID to release
-
-### `getStats()`
-
-Get performance statistics.
-
-**Returns:** Object with:
-- `totalHashes` (number): Total hashes calculated
-- `totalVerifications` (number): Total shares verified
-- `activeVMs` (number): Active VM count
-- `activeSeeds` (number): Active shared seed-resource count
-- `averageHashTime` (number): Average hash time in ms
-- `cacheHits` (number): Context cache hits
-- `cacheMisses` (number): Context cache misses
-
-### `getHardwareInfo()`
-
-Get hardware capability information.
-
-**Returns:** Object with:
-- `hasJit` (boolean): JIT compilation available
-- `hasAes` (boolean): AES acceleration available
-- `hasHugePages` (boolean): Large pages available
-- `cpuCores` (number): CPU core count
-- `totalMemory` (number): Total system memory
-- `hugePagesAvailable` (number): Available huge pages
+- `getStats()`: `totalHashes`, `totalVerifications`, `activeContexts`, `activeVMs`, `activeSeeds`,
+  `averageHashTime` (ms), `cacheHits`, `cacheMisses`, `variants: { 'rx/0': { totalHashes, averageHashTime }, 'rx/2': ... }`,
+  `memory: { dataset: { hugetlb, thp, normal }, cache: { ... } }` (live seeds per backing)
+- `getHardwareInfo()`: `hasJit`, `hasAes`, `hasHugePages`, `cpuCores`, `totalMemory`,
+  `hugePages: { pageSizeKB, total, free, reserved, available }`, `hugePagesAvailable` (= `available`),
+  `transparentHugePages: { enabled, defrag }`
+- `capabilities()`: `{ abi, variants, commitment, randomx }`. `abi` is checked at load (an
+  out-of-date build throws "native addon is out of date"); `randomx` is the compiled-in RandomX
+  commit, which differs from package.json `randomx.commit` when the build is stale
+- `LIMITS`: caps for `threads`, `vmPoolSize` and `maxSeeds`
+- `normalizeInitOptions(options)`: the validated options `initContext` passes to native code
+- Legacy aliases: `createContextCache` = `createSeedPool`, `createPoolEpochCache` =
+  `createPoolSeedPool`, `RandomXContextCache` = `SeedPool`
+- `getVariant(blob)`, `VARIANTS`, `MONERO_RX2_MAJOR_VERSION`
 
 ## Build System
 
@@ -296,8 +309,9 @@ For maximum performance on Linux:
 # Enable performance governor
 echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 
-# Allocate huge pages (adjust count as needed)
-echo 1024 | sudo tee /proc/sys/vm/nr_hugepages
+# Optional: reserve 2 MiB huge pages (~1,200 per fast-mode seed). Without them the addon
+# uses transparent huge pages when THP is `always` or `madvise`.
+echo 1250 | sudo tee /proc/sys/vm/nr_hugepages
 
 # Set CPU affinity for mining processes
 taskset -c 0-3 node your-pool-server.js
@@ -311,18 +325,15 @@ class PoolServer {
     constructor() {
         this.contexts = randomx.createPoolSeedPool({
             maxSeeds: 2,      // current + previous seed_hash
-            vmPoolSize: 2,    // two VMs can share one dataset for concurrent work
-            mode: 'fast',
-            enableHugePages: false
+            vmPoolSize: 2,    // up to two VMs per variant share one dataset
+            mode: 'fast'
         });
     }
 
-    getContext(seedHex) {
-        return this.contexts.getContextFromHex(seedHex);
-    }
-
-    verifyShare(seedHex, shareData, target) {
-        return this.contexts.verifyShareFromHex(seedHex, shareData, target);
+    // `pow` is compared with the target and with the miner's `result`
+    powFor(seedHex, hashingBlob) {
+        const variant = randomx.getVariant(hashingBlob);
+        return this.contexts.powAsyncFromHex(seedHex, hashingBlob, { variant });
     }
 }
 ```
@@ -335,13 +346,19 @@ For real pool deployments, a useful pattern is:
 - let pool workers send hash requests over a local socket
 - use `createPoolSeedPool({ maxSeeds: 2, vmPoolSize: N, mode: 'fast' })`
 - call `seedPool.warmSeedAsync(seed)` when a new `seed_hash` appears so dataset init happens off the main thread
-- call `seedPool.hashAsync(seed, input)` inside the broker so one process can overlap requests
+- call `seedPool.powAsync(seed, input, { variant })` inside the broker so one process can overlap requests
+- pass the job's variant on every request, and check `capabilities()` on both sides so a stale broker can't silently return v1 hashes
 
 See:
 
-- `examples/pool-broker.js`
-- `examples/pool-cryptonote-style.js`
-- `examples/pool-server.js`
+- `examples/pool-broker.js`: broker protocol 2 (`hello` handshake, `pow` with `variant`, `stats`),
+  and a client that refuses rx/2 work on a peer that didn't report it
+- `examples/pool-cryptonote-style.js`: variant per job from the blob, plus the cheap rx/2 submit
+  pre-check (xmrig sends the commitment as `result` and the raw hash as `commitment`)
+- `examples/pool-server.js`: async verification with exact BigInt share difficulty
+- `examples/memory-backing.js`: which pages each seed actually got, how many huge pages a seed
+  needs, and detecting a fallback (`node examples/memory-backing.js [--fast]`)
+- `examples/init-with-fallback.js`: fast mode with a light-mode fallback
 
 ## Benchmarks
 
@@ -364,11 +381,15 @@ npm install
 # Rebuild addon only (keep RandomX)
 npm run build
 
-# Run verification
+# Run verification (also fails on a stale build)
 npm run verify
 
-# Run tests
+# Run tests: upstream known-answer vectors for rx/0, rx/2 and commitments in every mode and
+# memory backing (vectors.test.js), SeedPool behaviour (seedpool.test.js), legacy API (test.js)
 npm test
+
+# Fast mode with and without reserved huge pages (~2 GiB per run)
+npm run test:fast-mode
 
 # Clean local build output
 npm run clean
@@ -378,7 +399,9 @@ npm run clean
 
 `deps/randomx` is a squashed [git subtree](https://github.com/tevador/RandomX), not a submodule:
 npm installs `github:` dependencies from GitHub tarballs, which never contain submodule files.
-The pinned upstream commit is recorded in the subtree commit (`git-subtree-split: <sha>`).
+The pinned upstream commit is recorded in the subtree commit (`git-subtree-split: <sha>`) and in
+package.json `randomx.commit`, which the build compiles in as `capabilities().randomx`. `npm run
+verify` fails when the two differ, i.e. the addon wasn't rebuilt after an update.
 
 Use the update script instead of copying files by hand:
 
@@ -399,9 +422,10 @@ export, so your working tree and `build/Release` stay untouched until every chec
 
 - v1 hashes from the new build must be identical to your current `build/Release` (consensus check)
 - upstream `randomx-tests` must pass (includes RandomX v2 and commitment vectors)
-- `test/test.js` must pass
+- `npm test` must pass (known-answer vectors for rx/0, rx/2 and commitments, SeedPool, legacy API)
 
-It then merges the update as one squashed subtree commit. Run it on a clean branch: tracked
+It then merges the update as one squashed subtree commit and records the new commit in
+package.json `randomx.commit`. Run it on a clean branch: tracked
 files must have no uncommitted changes. It refuses targets older than upstream `7c761cf`, which
 fixes wrong RandomX v2 code generation in the x86 JIT (present in the `v2.0.1` tag).
 `--no-verify` skips the checks.
@@ -435,11 +459,10 @@ sudo apt-get install cmake  # Ubuntu/Debian
 brew install cmake          # macOS
 ```
 
-**Large pages not available:**
-- This is normal and doesn't affect functionality
-- Large pages are off unless explicitly requested
-- For pool brokers, start with `enableHugePages: false` and only enable after verifying the host can satisfy allocation reliably
-- `getContextInfo(contextId).usedLargePages` is conservative; it stays `false` unless the addon can prove large-page backing
+**Huge pages not used (`memory.dataset` is `'normal'`):**
+- This is normal and doesn't affect correctness; hashing is ~15% slower than with huge pages
+- Check `getHardwareInfo().hugePages.available` (free minus reserved) and `transparentHugePages.enabled`
+- THP set to `never` and no reserved pages leaves only normal pages; set THP to `madvise` or reserve pages
 
 ### Build Verification
 

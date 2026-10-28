@@ -1,172 +1,164 @@
 /**
- * Example mining pool server using RandomX share verification
- * Uses createSeedPool (LRU) so multiple seed_hash values can coexist
- * during fork transitions without unbounded RAM growth.
+ * Example mining pool server using RandomX share verification.
+ *
+ * - createSeedPool (LRU) lets several seed_hash values coexist during an epoch change without
+ *   unbounded RAM growth.
+ * - Shares are hashed with powAsync on the libuv pool so the event loop never runs a RandomX hash
+ *   or a dataset build (SeedPool#verifyShare does the same check synchronously).
+ * - The variant comes from the job (`getVariant`), never from a global setting, so jobs
+ *   issued before a fork keep verifying as rx/0 afterwards.
+ * - Memory backing is logged per seed once it is built.
  */
 
+'use strict';
+
+const crypto = require('crypto');
 const os = require('os');
 const randomx = require('../index');
-const crypto = require('crypto');
+
+const TWO_256 = 1n << 256n;
+
+/** 32-byte little-endian value (a RandomX hash or commitment) as a BigInt. */
+function fromLittleEndian(buffer) {
+    return BigInt('0x' + (Buffer.from(buffer).reverse().toString('hex') || '0'));
+}
+
+/**
+ * Difficulty a PoW value meets: floor(2^256 / pow), Monero's definition. A share is valid for
+ * difficulty D when shareDifficulty >= D (equivalently pow * D < 2^256).
+ */
+function shareDifficulty(pow) {
+    const value = fromLittleEndian(pow);
+    return value === 0n ? TWO_256 : TWO_256 / value;
+}
 
 class MiningPool {
     constructor() {
         this.rxCache = randomx.createSeedPool({
             maxSeeds: 2,
-            mode: 'fast',
-            threads: Math.max(1, os.cpus().length),
-            enableHugePages: false
+            mode: process.argv.includes('--fast') ? 'fast' : 'light',
+            vmPoolSize: Math.max(1, Math.floor(os.cpus().length / 4))
         });
-
-        this.shares = [];
-        this.stats = {
-            validShares: 0,
-            invalidShares: 0,
-            totalHashrate: 0
-        };
+        this.reportedSeeds = new Set();
+        this.stats = { validShares: 0, invalidShares: 0 };
 
         console.log('Mining Pool Server initialized');
         this.logHardwareInfo();
     }
 
     logHardwareInfo() {
-        const hwInfo = randomx.getHardwareInfo();
+        const hw = randomx.getHardwareInfo();
+        const caps = randomx.capabilities();
         console.log('Hardware Capabilities:');
-        console.log(`- JIT Compilation: ${hwInfo.hasJit ? '✓' : '✗'}`);
-        console.log(`- AES Acceleration: ${hwInfo.hasAes ? '✓' : '✗'}`);
-        console.log(`- Large Pages: ${hwInfo.hasHugePages ? '✓' : '✗'}`);
-        console.log(`- CPU Cores: ${hwInfo.cpuCores}`);
-        console.log(`- Total Memory: ${(hwInfo.totalMemory / 1024 / 1024 / 1024).toFixed(1)} GB`);
+        console.log(`- JIT Compilation: ${hw.hasJit ? '✓' : '✗'}`);
+        console.log(`- AES Acceleration: ${hw.hasAes ? '✓' : '✗'}`);
+        console.log(`- Huge pages: ${hw.hugePages.available} usable of ${hw.hugePages.total}, THP ${hw.transparentHugePages.enabled}`);
+        console.log(`- CPU Cores: ${hw.cpuCores}`);
+        console.log(`- Total Memory: ${(hw.totalMemory / 1024 / 1024 / 1024).toFixed(1)} GB`);
+        console.log(`- Variants: ${caps.variants.join(', ')} (RandomX ${caps.randomx.slice(0, 12)})`);
         console.log('');
     }
 
+    /** Log what a seed's memory ended up on, once per seed. */
+    reportSeed(seedHex) {
+        if (this.reportedSeeds.has(seedHex)) {
+            return;
+        }
+        this.reportedSeeds.add(seedHex);
+        const memory = this.rxCache.getMemoryInfo(Buffer.from(seedHex, 'hex'));
+        console.log(`Seed ${seedHex.slice(0, 16)}… ready: dataset=${memory.dataset} cache=${memory.cache}` +
+            ` scratchpads: hugetlb=${memory.scratchpad.hugetlb} normal=${memory.scratchpad.normal}`);
+    }
+
     /**
-     * Verify a mining share
+     * Verify a share.
+     * @param {string} minerAddress
+     * @param {Buffer} hashingBlob job blob with the miner's nonce
+     * @param {string} seedHex job seed_hash
+     * @param {number} difficulty share difficulty
+     * @param {Buffer} [minerResult] `result` from the submit: the hash (rx/0) or commitment (rx/2)
      */
-    verifyShare(minerAddress, jobId, nonce, seedHex, difficulty) {
+    async verifyShare(minerAddress, hashingBlob, seedHex, difficulty, minerResult = null) {
         try {
-            const shareData = Buffer.concat([
-                Buffer.from(jobId, 'hex'),
-                Buffer.from(minerAddress, 'utf8'),
-                Buffer.from(nonce.toString(16).padStart(8, '0'), 'hex')
-            ]);
+            const variant = randomx.getVariant(hashingBlob);
+            const seed = Buffer.from(seedHex, 'hex');
+            await this.rxCache.warmSeedAsync(seed); // no-op once built; builds off the event loop
+            this.reportSeed(seedHex);
 
-            const target = this.difficultyToTarget(difficulty);
-
-            const startTime = Date.now();
-            const result = this.rxCache.verifyShareFromHex(seedHex, shareData, target);
-            const verifyTime = Date.now() - startTime;
-
-            const shareInfo = {
+            const started = process.hrtime.bigint();
+            const { pow } = await this.rxCache.powAsync(seed, hashingBlob, { variant });
+            const reached = shareDifficulty(pow);
+            const matches = !minerResult || pow.equals(minerResult);
+            const share = {
                 miner: minerAddress,
-                jobId: jobId.substring(0, 8),
-                nonce: nonce,
-                difficulty: difficulty,
-                valid: result.valid,
-                hash: result.hash.toString('hex'),
-                verifyTime: verifyTime
+                variant,
+                difficulty,
+                valid: matches && reached >= BigInt(difficulty),
+                shareDifficulty: reached.toString(),
+                verifyTime: Number(process.hrtime.bigint() - started) / 1e6
             };
 
-            this.shares.push(shareInfo);
-
-            if (result.valid) {
+            if (share.valid) {
                 this.stats.validShares++;
-                console.log(`✓ Valid share from ${minerAddress} (diff: ${difficulty}, time: ${verifyTime}ms)`);
             } else {
                 this.stats.invalidShares++;
-                console.log(`✗ Invalid share from ${minerAddress} (diff: ${difficulty}, time: ${verifyTime}ms)`);
             }
-
-            return shareInfo;
+            console.log(`${share.valid ? '✓' : '✗'} ${variant} share from ${minerAddress}` +
+                ` (diff ${difficulty}, reached ${share.shareDifficulty}, ${share.verifyTime.toFixed(2)} ms)`);
+            return share;
         } catch (error) {
             console.error(`Share verification failed: ${error.message}`);
             this.stats.invalidShares++;
-            return {
-                miner: minerAddress,
-                valid: false,
-                error: error.message
-            };
+            return { miner: minerAddress, valid: false, error: error.message };
         }
-    }
-
-    difficultyToTarget(difficulty) {
-        const target = Buffer.alloc(32, 0xff);
-
-        if (difficulty > 1) {
-            const leadingZeros = Math.floor(Math.log2(difficulty) / 8);
-            for (let i = 0; i < Math.min(leadingZeros, 31); i++) {
-                target[31 - i] = 0x00;
-            }
-
-            if (leadingZeros < 31) {
-                target[31 - leadingZeros] = Math.floor(0xff / (difficulty / Math.pow(2, leadingZeros * 8)));
-            }
-        }
-
-        return target;
     }
 
     getStats() {
-        const randomxStats = randomx.getStats();
-
         return {
             pool: this.stats,
-            randomx: randomxStats,
+            randomx: randomx.getStats(),
             rxCache: this.rxCache.getSnapshot()
         };
     }
 
     shutdown() {
         console.log('Shutting down mining pool...');
-
-        this.rxCache.releaseAll();
-
         const finalStats = this.getStats();
+        this.rxCache.releaseAll();
         console.log('Final Statistics:');
         console.log(`- Valid shares: ${finalStats.pool.validShares}`);
         console.log(`- Invalid shares: ${finalStats.pool.invalidShares}`);
-        console.log(`- Total RandomX hashes: ${finalStats.randomx.totalHashes}`);
-        console.log(`- Average hash time (see note in getStats): ${finalStats.randomx.averageHashTime.toFixed(3)}`);
-
+        console.log(`- RandomX hashes: ${finalStats.randomx.totalHashes}`,
+            `(rx/0 ${finalStats.randomx.variants['rx/0'].totalHashes}, rx/2 ${finalStats.randomx.variants['rx/2'].totalHashes})`);
+        console.log(`- Average hash time: ${finalStats.randomx.averageHashTime.toFixed(3)} ms`);
         console.log('Pool server shutdown complete');
     }
 }
 
-function runDemo() {
+async function runDemo() {
     const pool = new MiningPool();
-
     const seedHex = crypto.randomBytes(32).toString('hex');
     const miners = ['miner1', 'miner2', 'miner3'];
 
-    console.log('Starting mining simulation...\n');
+    console.log('Starting mining simulation (random nonces, so most shares miss the target)...\n');
 
-    let shareCount = 0;
-    const submitShare = () => {
-        const miner = miners[Math.floor(Math.random() * miners.length)];
-        const jobId = crypto.randomBytes(16).toString('hex');
-        const nonce = Math.floor(Math.random() * 0xffffffff);
-        const difficulty = Math.pow(2, Math.floor(Math.random() * 10) + 10);
+    for (let i = 0; i < 20; i++) {
+        const blob = crypto.randomBytes(76);
+        blob[0] = i < 10 ? 16 : 17; // second half after the v17 fork: rx/2
+        const difficulty = 2 ** (Math.floor(Math.random() * 4) + 1);
+        await pool.verifyShare(miners[i % miners.length], blob, seedHex, difficulty);
+    }
 
-        pool.verifyShare(miner, jobId, nonce, seedHex, difficulty);
-        shareCount++;
-
-        if (shareCount < 20) {
-            setTimeout(submitShare, 100 + Math.random() * 200);
-        } else {
-            setTimeout(() => {
-                console.log('\nSimulation complete!');
-                console.log('\nFinal Pool Statistics:');
-                console.log(JSON.stringify(pool.getStats(), null, 2));
-
-                pool.shutdown();
-            }, 1000);
-        }
-    };
-
-    submitShare();
+    console.log('\nSimulation complete!');
+    console.log(JSON.stringify(pool.getStats().rxCache, null, 2));
+    pool.shutdown();
 }
 
 if (require.main === module) {
-    runDemo();
+    runDemo().catch((error) => {
+        console.error(error.message);
+        process.exitCode = 1;
+    });
 }
 
-module.exports = MiningPool;
+module.exports = { MiningPool, shareDifficulty };

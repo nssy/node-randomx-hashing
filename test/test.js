@@ -45,7 +45,7 @@ async function runTests() {
         const meta = randomx.getContextInfo(contextId);
         assert(meta && meta.mode === 'light', 'getContextInfo mode');
         assert(meta.enableHugePages === false, 'default enableHugePages');
-        assert(meta.usedLargePages === false, 'no large pages in light default');
+        assert.strictEqual(meta.memory.cache, 'normal', 'enableHugePages: false uses normal pages');
         console.log('✓ Context initialization test passed\n');
 
         // Test 3: Hash Calculation
@@ -246,7 +246,7 @@ async function runTests() {
 
             const fastMeta = randomx.getContextInfo(fastCtxId);
             assert(fastMeta && fastMeta.mode === 'fast', 'getContextInfo mode is fast');
-            assert(fastMeta.usedLargePages === false, 'this test uses enableHugePages: false');
+            assert.strictEqual(fastMeta.memory.dataset, 'normal', 'this test uses enableHugePages: false');
 
             const fastHash = randomx.hash(fastCtxId, testInput);
             assert.strictEqual(fastHash.length, 32, 'fast hash length');

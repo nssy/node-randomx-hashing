@@ -45,3 +45,6 @@ temp/
 
 # Local planning notes (not part of the package)
 /plan/
+
+# Library: consumers never use this lockfile (npm ignores it in dependencies and never publishes it)
+/package-lock.json

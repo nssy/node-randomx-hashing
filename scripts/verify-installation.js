@@ -20,21 +20,32 @@ try {
     console.log(`  - Large Pages: ${hwInfo.hasHugePages ? '✓' : '✗'}`);
     console.log(`  - CPU Cores: ${hwInfo.cpuCores}`);
     console.log(`  - Total Memory: ${(hwInfo.totalMemory / 1024 / 1024 / 1024).toFixed(1)} GB`);
+    console.log(`  - Huge pages: ${hwInfo.hugePages.available} of ${hwInfo.hugePages.total} usable` +
+        ` (${hwInfo.hugePages.pageSizeKB} kB), THP ${hwInfo.transparentHugePages.enabled}`);
+
+    const caps = randomx.capabilities();
+    caps.randomx = caps.randomx || 'unknown';
+    const expectedCommit = require('../package.json').randomx.commit;
+    console.log(`✓ Variants: ${caps.variants.join(', ')}; RandomX ${caps.randomx.slice(0, 12)}`);
+    if (caps.randomx !== expectedCommit) {
+        throw new Error(`addon was built from RandomX ${caps.randomx.slice(0, 12)}, package.json pins ` +
+            `${expectedCommit.slice(0, 12)}; rebuild with \`npm run build\``);
+    }
 
     // Test context creation and hashing
-    const contextId = randomx.initContext(testSeed, {
-        enableJit: true,
-        enableAes: true,
-        enableHugePages: false // Safe default
-    });
-    console.log('✓ Context created successfully');
+    const contextId = randomx.initContext(testSeed, { enableJit: true, enableAes: true });
+    const memory = randomx.getContextInfo(contextId).memory;
+    console.log(`✓ Context created successfully (cache: ${memory.cache} pages)`);
 
     const testInput = Buffer.from('RandomX verification test', 'utf8');
     const hash = randomx.hash(contextId, testInput);
+    const rx2 = randomx.pow(contextId, testInput, { variant: 'rx/2' });
 
     if (hash && hash.length === 32) {
         console.log('✓ Hash calculation successful');
-        console.log(`  Hash: ${hash.toString('hex')}`);
+        console.log(`  rx/0 hash: ${hash.toString('hex')}`);
+        console.log(`  rx/2 hash: ${rx2.hash.toString('hex')}`);
+        console.log(`  rx/2 pow (commitment): ${rx2.pow.toString('hex')}`);
     } else {
         throw new Error('Hash calculation returned invalid result');
     }
@@ -64,8 +75,8 @@ try {
     console.error(error.message);
     console.error('\nTroubleshooting:');
     console.error('1. Ensure all build dependencies are installed');
-    console.error('2. Try running: npm run clean && npm install');
-    console.error('3. Check that git is available for downloading RandomX');
-    console.error('4. Verify CMake is installed if using manual build');
+    console.error('2. Try running: npm run clean && npm run build');
+    console.error('3. Check that deps/randomx is present (it ships with the package as a git subtree)');
+    console.error('4. Verify CMake is installed');
     process.exit(1);
 }

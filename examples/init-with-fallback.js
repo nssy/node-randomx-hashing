@@ -1,15 +1,15 @@
 /**
- * Prefer RandomX fast mode (full dataset), but fall back when init fails:
- *   1) fast + large/huge pages (best throughput if allocation succeeds)
- *   2) fast without large pages (still ~1–2 ms/hash, normal RAM)
- *   3) light (~256 MB cache only, slower per hash)
+ * Prefer RandomX fast mode (full dataset), but fall back to light mode when init fails
+ * (e.g. not enough RAM for the ~2 GB dataset on small hosts).
  *
- * Use this pattern when `enableHugePages: true` may fail (no hugetlb, ulimit, etc.)
- * or when fast mode OOMs on small hosts.
+ * Huge pages need no fallback here: each buffer already falls back natively from reserved
+ * hugetlb pages to transparent huge pages to normal pages, and records what it got
+ * (`getContextInfo(id).memory`; see examples/memory-backing.js).
  */
 
 const os = require('os');
 const randomx = require('../index');
+const { describeBacking, fellBack } = require('./memory-backing');
 
 /**
  * @param {Buffer} seed - 32-byte RandomX seed
@@ -28,36 +28,8 @@ function initContextPreferFastWithFallback(seed, options = {}) {
             : Math.max(1, os.cpus().length);
 
     const attempts = [
-        {
-            strategy: 'fast+hugepages',
-            opts: {
-                mode: 'fast',
-                enableHugePages: true,
-                enableJit,
-                enableAes,
-                threads: threadsFast
-            }
-        },
-        {
-            strategy: 'fast',
-            opts: {
-                mode: 'fast',
-                enableHugePages: false,
-                enableJit,
-                enableAes,
-                threads: threadsFast
-            }
-        },
-        {
-            strategy: 'light',
-            opts: {
-                mode: 'light',
-                enableHugePages: false,
-                enableJit,
-                enableAes,
-                threads: 1
-            }
-        }
+        { strategy: 'fast', opts: { mode: 'fast', enableJit, enableAes, threads: threadsFast } },
+        { strategy: 'light', opts: { mode: 'light', enableJit, enableAes, threads: 1 } }
     ];
 
     const failures = [];
@@ -85,6 +57,7 @@ function demo() {
     const meta = randomx.getContextInfo(contextId);
 
     console.log('Chosen strategy:', strategy);
+    console.log('Memory:', describeBacking(meta), fellBack(meta) ? '(huge pages fell back)' : '');
     console.log('getContextInfo:', meta);
 
     const t0 = Date.now();

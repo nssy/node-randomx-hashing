@@ -1,73 +1,262 @@
 /**
  * RandomX Context Manager Implementation
- * Efficient context reuse and memory management
+ * Shared per-seed resources (cache/dataset) with lazily created per-variant VM pools
  */
 
 #include "context_manager.h"
+#include "configuration.h"
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <system_error>
 #include <thread>
 #include <vector>
 
 #ifdef __linux__
+#include <sys/mman.h>
 #include <sys/sysinfo.h>
+#include <unistd.h>
 #endif
 
-std::unique_ptr<ContextManager> ContextManager::instance = nullptr;
-std::mutex ContextManager::instanceMutex;
+namespace {
+
+// Live VM count. A plain constant-initialized atomic rather than a ContextManager member: VM
+// pools can be destroyed during static destruction, after ContextManager's mutexes are gone.
+std::atomic<int64_t> liveVms{0};
+
+constexpr size_t kCacheBytes = static_cast<size_t>(RANDOMX_ARGON_MEMORY) * 1024;
+constexpr size_t kScratchpadBytes = RANDOMX_SCRATCHPAD_L3;
+
+std::string readFirstLine(const char* path) {
+    std::ifstream file(path);
+    std::string line;
+    std::getline(file, line);
+    return line;
+}
+
+uint64_t readNumber(const std::string& path) {
+    std::ifstream file(path);
+    uint64_t value = 0;
+    file >> value;
+    return value;
+}
+
+/** Selected value of a sysfs choice file, e.g. "always [madvise] never" -> "madvise". */
+std::string selectedChoice(const char* path) {
+    const std::string line = readFirstLine(path);
+    const size_t open = line.find('[');
+    const size_t close = line.find(']', open);
+    return (open == std::string::npos || close == std::string::npos) ? "" : line.substr(open + 1, close - open - 1);
+}
+
+HugePagePool readHugePagePool() {
+    HugePagePool pool = {};
+#ifdef __linux__
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    while (meminfo >> key) {
+        if (key == "Hugepagesize:") {
+            meminfo >> pool.pageSizeKB;
+            break;
+        }
+        meminfo.ignore(256, '\n');
+    }
+    if (pool.pageSizeKB == 0) {
+        return pool;
+    }
+    const std::string dir = "/sys/kernel/mm/hugepages/hugepages-" + std::to_string(pool.pageSizeKB) + "kB/";
+    pool.total = readNumber(dir + "nr_hugepages");
+    pool.free = readNumber(dir + "free_hugepages");
+    pool.reserved = readNumber(dir + "resv_hugepages");
+    pool.available = pool.free > pool.reserved ? pool.free - pool.reserved : 0;
+#endif
+    return pool;
+}
 
 /**
- * RandomXSeedResources destructor
+ * Worth trying RANDOMX_FLAG_LARGE_PAGES for `bytes`? A hint only: the allocation result decides.
+ * On Linux RandomX maps the *default* huge page size, so skip it unless that size is 2 MiB:
+ * 1 GiB pages are only ever used when the operator configures them explicitly.
  */
+bool hugetlbWorthTrying(size_t bytes) {
+#ifdef __linux__
+    const HugePagePool pool = readHugePagePool();
+    return pool.pageSizeKB == 2048 && pool.available * 2048 * 1024 >= bytes;
+#else
+    (void)bytes;
+    return true;
+#endif
+}
+
+bool thpEnabled() {
+#ifdef __linux__
+    static const bool enabled = [] {
+        const std::string mode = selectedChoice("/sys/kernel/mm/transparent_hugepage/enabled");
+        return mode == "always" || mode == "madvise";
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+/** Ask for transparent huge pages on [memory, memory + bytes). Must run before first touch. */
+bool adviseHugePages(void* memory, size_t bytes) {
+#ifdef __linux__
+    const uintptr_t page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+    const uintptr_t begin = (reinterpret_cast<uintptr_t>(memory) + page - 1) & ~(page - 1);
+    const uintptr_t end = (reinterpret_cast<uintptr_t>(memory) + bytes) & ~(page - 1);
+    return end > begin && madvise(reinterpret_cast<void*>(begin), end - begin, MADV_HUGEPAGE) == 0;
+#else
+    (void)memory;
+    (void)bytes;
+    return false;
+#endif
+}
+
+/**
+ * Allocate a cache or dataset trying hugetlb, then THP, then normal pages.
+ * `alloc` takes flags; `memoryOf` returns the buffer of the allocated object.
+ */
+template<typename T, typename Alloc, typename MemoryOf>
+T* allocWithBacking(randomx_flags flags, HugePageMode hugePages, size_t bytes, Alloc alloc, MemoryOf memoryOf, MemoryBacking& backing) {
+    if (hugePages == HugePageMode::ALL && hugetlbWorthTrying(bytes)) {
+        if (T* object = alloc(static_cast<randomx_flags>(flags | RANDOMX_FLAG_LARGE_PAGES))) {
+            backing = MemoryBacking::HUGETLB;
+            return object;
+        }
+    }
+    T* object = alloc(static_cast<randomx_flags>(flags & ~RANDOMX_FLAG_LARGE_PAGES));
+    if (object) {
+        backing = (hugePages != HugePageMode::OFF && thpEnabled() && adviseHugePages(memoryOf(object), bytes))
+            ? MemoryBacking::THP
+            : MemoryBacking::NORMAL;
+    }
+    return object;
+}
+
+randomx_flags baseFlags(const RandomXConfig& config) {
+    randomx_flags flags = randomx_get_flags();
+    if (!config.enableJit) {
+        flags = static_cast<randomx_flags>(flags & ~(RANDOMX_FLAG_JIT | RANDOMX_FLAG_SECURE));
+    }
+    if (!config.enableAes) {
+        flags = static_cast<randomx_flags>(flags & ~RANDOMX_FLAG_HARD_AES);
+    }
+    return flags;
+}
+
+} // namespace
+
 RandomXSeedResources::~RandomXSeedResources() {
     if (dataset) {
         randomx_release_dataset(dataset);
-        dataset = nullptr;
     }
     if (cache) {
         randomx_release_cache(cache);
-        cache = nullptr;
     }
 }
 
-/**
- * RandomXContext destructor
- */
-RandomXContext::~RandomXContext() {
-    if (vm) {
+RandomXVmPool::RandomXVmPool(std::shared_ptr<RandomXSeedResources> resources, RandomXVariant variant, uint32_t maxSize)
+    : resources(std::move(resources)), variant(variant), maxSize(std::max<uint32_t>(1, maxSize)) {
+    // release() runs in a lease destructor and must not allocate; maxSize only ever shrinks.
+    idle.reserve(this->maxSize);
+}
+
+RandomXVmPool::~RandomXVmPool() {
+    for (randomx_vm* vm : idle) {
         randomx_destroy_vm(vm);
-        vm = nullptr;
+        liveVms.fetch_sub(1);
     }
-    resources.reset();
 }
 
-/**
- * Get singleton instance
- */
+randomx_vm* RandomXVmPool::createVm() {
+    randomx_flags flags = resources->vmFlags;
+    if (variant == RandomXVariant::RX2) {
+        flags = static_cast<randomx_flags>(flags | RANDOMX_FLAG_V2);
+    }
+    // Fast-mode VMs only read the dataset; the cache is released after dataset init.
+    randomx_cache* cache = resources->dataset ? nullptr : resources->cache;
+
+    randomx_vm* vm = nullptr;
+    if (resources->config.hugePages == HugePageMode::ALL && hugetlbWorthTrying(kScratchpadBytes)) {
+        vm = randomx_create_vm(static_cast<randomx_flags>(flags | RANDOMX_FLAG_LARGE_PAGES), cache, resources->dataset);
+        if (vm) {
+            hugetlbCount.fetch_add(1);
+        }
+    }
+    if (!vm) {
+        vm = randomx_create_vm(flags, cache, resources->dataset);
+    }
+    if (vm) {
+        liveVms.fetch_add(1);
+    }
+    return vm;
+}
+
+randomx_vm* RandomXVmPool::acquire() {
+    std::unique_lock<std::mutex> lock(mutex);
+    for (;;) {
+        if (!idle.empty()) {
+            randomx_vm* vm = idle.back();
+            idle.pop_back();
+            return vm;
+        }
+        if (createdCount.load() < maxSize) {
+            createdCount.fetch_add(1);
+            lock.unlock();
+            if (randomx_vm* vm = createVm()) {
+                return vm;
+            }
+            lock.lock();
+            // Out of memory for another VM: stop growing and share the VMs that exist. Fail only
+            // when there are none.
+            maxSize = createdCount.fetch_sub(1) - 1;
+            if (maxSize == 0) {
+                maxSize = 1;
+                available.notify_all();
+                return nullptr;
+            }
+            continue;
+        }
+        available.wait(lock);
+    }
+}
+
+void RandomXVmPool::release(randomx_vm* vm) {
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        idle.push_back(vm);
+    }
+    available.notify_one();
+}
+
+std::shared_ptr<RandomXVmPool> RandomXContext::pool(RandomXVariant variant) {
+    std::lock_guard<std::mutex> lock(poolsMutex);
+    auto& slot = pools[static_cast<size_t>(variant)];
+    if (!slot) {
+        slot = std::make_shared<RandomXVmPool>(resources, variant, vmPoolSize);
+    }
+    return slot;
+}
+
 ContextManager& ContextManager::getInstance() {
-    std::lock_guard<std::mutex> lock(instanceMutex);
-    if (!instance) {
-        instance = std::unique_ptr<ContextManager>(new ContextManager());
-    }
-    return *instance;
+    // Thread-safe initialization without a lock on every call (called per hash).
+    static ContextManager instance;
+    return instance;
 }
 
-/**
- * Private constructor
- */
 ContextManager::ContextManager()
     : nextContextId(1),
-      totalHashes(0),
-      totalHashTimeMicros(0),
+      totalHashes(),
+      totalHashTimeMicros(),
       totalVerifications(0),
       cacheHits(0),
       cacheMisses(0) {}
 
-/**
- * Destructor
- */
 ContextManager::~ContextManager() {
     {
         std::lock_guard<std::mutex> seedLock(seedResourcesMutex);
@@ -80,150 +269,116 @@ ContextManager::~ContextManager() {
     }
 }
 
-randomx_flags ContextManager::getOptimalFlags(const RandomXConfig& config) {
-    randomx_flags flags = RANDOMX_FLAG_DEFAULT;
-
-    if (config.enableJit) {
-        flags |= RANDOMX_FLAG_JIT;
+/**
+ * Create a new context: shared seed resources plus one eagerly created rx/0 VM, so
+ * allocation problems surface here rather than on the first hash. Returns 0 on failure,
+ * including allocation failures: an exception must never escape into N-API or a libuv worker.
+ */
+uint32_t ContextManager::createContext(const uint8_t* seed, size_t seedLength, const RandomXConfig& config) {
+    try {
+        return createContextUnchecked(seed, seedLength, config);
+    } catch (const std::exception&) {
+        return 0;
     }
-
-    if (config.enableAes) {
-        flags |= RANDOMX_FLAG_HARD_AES;
-    }
-
-    // randomx_get_flags() does NOT include RANDOMX_FLAG_LARGE_PAGES (RandomX upstream design;
-    // see api-example2.cpp: flags = randomx_get_flags(); flags |= RANDOMX_FLAG_LARGE_PAGES).
-    // When set, randomx_alloc_cache/dataset catch failures and return nullptr — no extra build flag needed.
-    if (config.enableHugePages && config.mode == RandomXMode::FAST) {
-        flags |= RANDOMX_FLAG_LARGE_PAGES;
-    }
-
-    // Set memory mode based on configuration
-    switch (config.mode) {
-        case RandomXMode::FAST:
-            flags |= RANDOMX_FLAG_FULL_MEM;
-            break;
-        case RandomXMode::LIGHT:
-            // Light mode: don't add RANDOMX_FLAG_FULL_MEM
-            break;
-    }
-
-    return flags;
 }
 
-/**
- * Create a new RandomX context
- */
-uint32_t ContextManager::createContext(const uint8_t* seed, const RandomXConfig& config) {
-    auto resources = acquireSeedResources(seed, config);
+uint32_t ContextManager::createContextUnchecked(const uint8_t* seed, size_t seedLength, const RandomXConfig& config) {
+    auto resources = acquireSeedResources(std::string(reinterpret_cast<const char*>(seed), seedLength), config);
     if (!resources) {
         return 0;
     }
 
     auto context = std::make_shared<RandomXContext>();
-    context->resources = resources;
-
-    context->vm = randomx_create_vm(resources->flags, resources->cache, resources->dataset);
-    if (!context->vm) {
-        return 0;
+    context->resources = std::move(resources);
+    context->vmPoolSize = std::max<uint32_t>(1, config.vmPoolSize);
+    {
+        RandomXVmLease lease(context->pool(RandomXVariant::RX0));
+        if (!lease.get()) {
+            return 0;
+        }
     }
 
-    // Set last used timestamp
-    context->lastUsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-
-    // Store context and return ID
-    uint32_t contextId = nextContextId.fetch_add(1);
+    const uint32_t contextId = nextContextId.fetch_add(1);
     {
         std::lock_guard<std::mutex> lock(contextsMutex);
         contexts[contextId] = std::move(context);
     }
-
     return contextId;
 }
 
 /**
- * Release a RandomX context
+ * Release a context. In-flight hashes keep their VM pool and seed resources alive.
  */
 bool ContextManager::releaseContext(uint32_t contextId) {
     std::lock_guard<std::mutex> lock(contextsMutex);
-    auto it = contexts.find(contextId);
-    if (it != contexts.end()) {
-        contexts.erase(it);
-        return true;
-    }
-    return false;
+    return contexts.erase(contextId) > 0;
 }
 
-/**
- * Get a RandomX context by ID
- */
-std::shared_ptr<RandomXContext> ContextManager::getContext(uint32_t contextId, bool updateLastUsed) {
+std::shared_ptr<RandomXContext> ContextManager::getContext(uint32_t contextId) const {
     std::lock_guard<std::mutex> lock(contextsMutex);
     auto it = contexts.find(contextId);
-    if (it != contexts.end()) {
-        if (updateLastUsed) {
-            it->second->lastUsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-        }
-        return it->second;
-    }
-    return nullptr;
+    return it != contexts.end() ? it->second : nullptr;
 }
 
-bool ContextManager::getContextInfo(
-    uint32_t contextId,
-    bool& outUsedLargePages,
-    bool& outRequestedLargePages,
-    RandomXMode& outMode
-) {
-    auto ctx = getContext(contextId, false);
+bool ContextManager::getContextInfo(uint32_t contextId, ContextInfo& out) const {
+    auto ctx = getContext(contextId);
     if (!ctx) {
         return false;
     }
-    outUsedLargePages = ctx->resources && ctx->resources->usedLargePages;
-    outRequestedLargePages = ctx->resources && ctx->resources->config.enableHugePages;
-    outMode = ctx->resources ? ctx->resources->config.mode : RandomXMode::LIGHT;
+    out = {};
+    out.mode = ctx->resources->config.mode;
+    out.hugePages = ctx->resources->config.hugePages;
+    out.vmPoolSize = ctx->vmPoolSize;
+    out.datasetBacking = ctx->resources->datasetBacking;
+    out.cacheBacking = ctx->resources->cacheBacking;
+
+    std::lock_guard<std::mutex> lock(ctx->poolsMutex);
+    for (size_t i = 0; i < kVariantCount; i++) {
+        if (ctx->pools[i]) {
+            out.vms[i] = ctx->pools[i]->created();
+            out.hugetlbScratchpads += ctx->pools[i]->hugetlbScratchpads();
+        }
+    }
     return true;
 }
 
-/**
- * Get performance statistics
- */
 PerformanceStats ContextManager::getStats() const {
     PerformanceStats stats = {};
-    stats.totalHashes = totalHashes.load();
     stats.totalVerifications = totalVerifications.load();
     stats.cacheHits = cacheHits.load();
     stats.cacheMisses = cacheMisses.load();
+    stats.activeVMs = static_cast<uint32_t>(std::max<int64_t>(0, liveVms.load()));
+
+    uint64_t allMicros = 0;
+    for (size_t i = 0; i < kVariantCount; i++) {
+        const uint64_t n = totalHashes[i].load();
+        const uint64_t micros = totalHashTimeMicros[i].load();
+        stats.variants[i].totalHashes = n;
+        stats.variants[i].averageHashTime = n ? static_cast<double>(micros) / static_cast<double>(n) / 1000.0 : 0.0;
+        stats.totalHashes += n;
+        allMicros += micros;
+    }
+    if (stats.totalHashes > 0) {
+        stats.averageHashTime = static_cast<double>(allMicros) / static_cast<double>(stats.totalHashes) / 1000.0;
+    }
 
     {
-        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(contextsMutex));
-        stats.activeContexts = contexts.size();
+        std::lock_guard<std::mutex> lock(contextsMutex);
+        stats.activeContexts = static_cast<uint32_t>(contexts.size());
     }
     {
-        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(seedResourcesMutex));
-        uint32_t activeSeeds = 0;
+        std::lock_guard<std::mutex> lock(seedResourcesMutex);
         for (const auto& entry : seedResources) {
-            if (!entry.second.expired()) {
-                activeSeeds++;
+            if (auto resources = entry.second.lock()) {
+                stats.activeSeeds++;
+                stats.datasetBackings[static_cast<size_t>(resources->datasetBacking)]++;
+                stats.cacheBackings[static_cast<size_t>(resources->cacheBacking)]++;
             }
         }
-        stats.activeSeeds = activeSeeds;
     }
-
-    const uint64_t n = stats.totalHashes;
-    if (n > 0) {
-        stats.averageHashTime =
-            static_cast<double>(totalHashTimeMicros.load()) / static_cast<double>(n) / 1000.0;
-    }
-
     return stats;
 }
 
-/**
- * Get hardware capability information
- */
 HardwareInfo ContextManager::getHardwareInfo() const {
     HardwareInfo info = {};
 
@@ -239,72 +394,58 @@ HardwareInfo ContextManager::getHardwareInfo() const {
 #else
     info.hasHugePages = false;
 #endif
+    info.cpuCores = std::thread::hardware_concurrency();
 
 #ifdef __linux__
-    // Get system information
-    info.cpuCores = std::thread::hardware_concurrency();
-
     struct sysinfo si;
     if (sysinfo(&si) == 0) {
-        info.totalMemory = si.totalram * si.mem_unit;
+        info.totalMemory = static_cast<uint64_t>(si.totalram) * si.mem_unit;
     }
-
-    // Check huge pages availability
-    FILE* fp = fopen("/proc/meminfo", "r");
-    if (fp) {
-        char line[256];
-        while (fgets(line, sizeof(line), fp)) {
-            if (strncmp(line, "HugePages_Free:", 15) == 0) {
-                sscanf(line + 15, "%u", &info.hugePagesAvailable);
-                break;
-            }
-        }
-        fclose(fp);
-    }
-#else
-    info.cpuCores = std::thread::hardware_concurrency();
-    info.totalMemory = 0; // Platform-specific implementation needed
-    info.hugePagesAvailable = 0;
+    info.hugePages = readHugePagePool();
+    info.thpEnabled = selectedChoice("/sys/kernel/mm/transparent_hugepage/enabled");
+    info.thpDefrag = selectedChoice("/sys/kernel/mm/transparent_hugepage/defrag");
 #endif
 
     return info;
 }
 
-/**
- * Record hash operation for performance tracking
- */
-void ContextManager::recordHash(uint32_t contextId, uint64_t elapsedMicros) {
-    totalHashes.fetch_add(1);
-    totalHashTimeMicros.fetch_add(elapsedMicros);
+void ContextManager::recordHash(RandomXVariant variant, uint64_t elapsedMicros) {
+    totalHashes[static_cast<size_t>(variant)].fetch_add(1);
+    totalHashTimeMicros[static_cast<size_t>(variant)].fetch_add(elapsedMicros);
 }
 
-/**
- * Record verification operation for performance tracking
- */
-void ContextManager::recordVerification(uint32_t contextId) {
+void ContextManager::recordVerification() {
     totalVerifications.fetch_add(1);
 }
 
-std::string ContextManager::makeSeedKey(const uint8_t* seed, const RandomXConfig& config) const {
-    std::string key(reinterpret_cast<const char*>(seed), 32);
+std::string ContextManager::makeSeedKey(const std::string& seed, const RandomXConfig& config) const {
+    std::string key = seed;
     key.push_back(static_cast<char>(config.mode));
     key.push_back(static_cast<char>(config.enableJit ? 1 : 0));
     key.push_back(static_cast<char>(config.enableAes ? 1 : 0));
-    key.push_back(static_cast<char>(config.enableHugePages ? 1 : 0));
+    key.push_back(static_cast<char>(config.hugePages));
+    key.push_back(static_cast<char>(seed.size()));
     return key;
 }
 
-std::shared_ptr<RandomXSeedResources> ContextManager::acquireSeedResources(const uint8_t* seed, const RandomXConfig& config) {
+/**
+ * Return the shared resources for (seed, config), creating them once even when several
+ * threads ask for the same seed concurrently.
+ */
+std::shared_ptr<RandomXSeedResources> ContextManager::acquireSeedResources(const std::string& seed, const RandomXConfig& config) {
     const std::string key = makeSeedKey(seed, config);
     std::shared_ptr<RandomXSeedInitState> initState;
     bool creator = false;
 
     {
         std::lock_guard<std::mutex> lock(seedResourcesMutex);
+        for (auto it = seedResources.begin(); it != seedResources.end();) {
+            it = it->second.expired() ? seedResources.erase(it) : std::next(it);
+        }
         auto it = seedResources.find(key);
         if (it != seedResources.end()) {
-            auto existing = it->second.lock();
-            if (existing) {
+            // The last owner may release outside this mutex, so lock() can still come back empty.
+            if (auto existing = it->second.lock()) {
                 cacheHits.fetch_add(1);
                 return existing;
             }
@@ -323,104 +464,99 @@ std::shared_ptr<RandomXSeedResources> ContextManager::acquireSeedResources(const
 
     if (!creator) {
         std::unique_lock<std::mutex> waitLock(initState->mutex);
-        initState->cv.wait(waitLock, [&initState]() {
-            return initState->done;
-        });
+        initState->cv.wait(waitLock, [&initState]() { return initState->done; });
         return initState->resources;
     }
 
-    auto resources = std::make_shared<RandomXSeedResources>();
-    memcpy(resources->seed, seed, 32);
-    resources->config = config;
-    resources->flags = getOptimalFlags(config);
-    // RandomX does not expose whether huge-page allocation actually succeeded, so do not
-    // report requested flags as if they proved the final mapping used large pages.
-    resources->usedLargePages = false;
     cacheMisses.fetch_add(1);
-
-    resources->cache = randomx_alloc_cache(resources->flags);
-    if (!resources->cache) {
-        {
-            std::lock_guard<std::mutex> waitLock(initState->mutex);
-            initState->resources.reset();
-            initState->done = true;
-        }
-        {
-            std::lock_guard<std::mutex> lock(seedResourcesMutex);
-            seedInitStates.erase(key);
-        }
-        initState->cv.notify_all();
-        return nullptr;
+    // Whatever happens, finish initState: waiters would otherwise block forever, and the stale
+    // entry would make every later request for this seed wait too.
+    std::shared_ptr<RandomXSeedResources> resources;
+    try {
+        resources = createSeedResources(seed, config);
+    } catch (const std::exception&) {
+        resources = nullptr;  // e.g. bad_alloc in randomx_init_cache; partial buffers are freed
     }
 
-    randomx_init_cache(resources->cache, seed, 32);
-
-    if (config.mode == RandomXMode::FAST) {
-        resources->dataset = randomx_alloc_dataset(resources->flags);
-        if (!resources->dataset) {
-            {
-                std::lock_guard<std::mutex> waitLock(initState->mutex);
-                initState->resources.reset();
-                initState->done = true;
-            }
-            {
-                std::lock_guard<std::mutex> lock(seedResourcesMutex);
-                seedInitStates.erase(key);
-            }
-            initState->cv.notify_all();
-            return nullptr;
+    {
+        std::lock_guard<std::mutex> lock(seedResourcesMutex);
+        if (resources) {
+            seedResources[key] = resources;
         }
-
-        auto datasetItemCount = randomx_dataset_item_count();
-        uint32_t numThreads = config.threads;
-
-        if (numThreads > 1) {
-            std::vector<std::thread> initThreads;
-            auto itemsPerThread = datasetItemCount / numThreads;
-            auto remainder = datasetItemCount % numThreads;
-
-            randomx_dataset* dataset = resources->dataset;
-            randomx_cache* cache = resources->cache;
-
-            for (uint32_t i = 0; i < numThreads; i++) {
-                auto startItem = i * itemsPerThread;
-                auto itemCount = itemsPerThread;
-                if (i == numThreads - 1) {
-                    itemCount += remainder;
-                }
-
-                initThreads.emplace_back([dataset, cache, startItem, itemCount]() {
-                    randomx_init_dataset(dataset, cache, startItem, itemCount);
-                });
-            }
-
-            for (auto& thread : initThreads) {
-                thread.join();
-            }
-        } else {
-            randomx_init_dataset(resources->dataset, resources->cache, 0, datasetItemCount);
-        }
+        seedInitStates.erase(key);
     }
-
     {
         std::lock_guard<std::mutex> waitLock(initState->mutex);
         initState->resources = resources;
         initState->done = true;
     }
-    {
-        std::lock_guard<std::mutex> lock(seedResourcesMutex);
-        auto& slot = seedResources[key];
-        auto existing = slot.lock();
-        if (existing) {
-            seedInitStates.erase(key);
-            initState->cv.notify_all();
-            return existing;
-        }
-        slot = resources;
-        seedInitStates.erase(key);
+    initState->cv.notify_all();
+    return resources;
+}
+
+/**
+ * Allocate and initialize the cache (and in fast mode the dataset) for one seed.
+ * Each buffer records which memory backing it got.
+ */
+std::shared_ptr<RandomXSeedResources> ContextManager::createSeedResources(const std::string& seed, const RandomXConfig& config) {
+    auto resources = std::make_shared<RandomXSeedResources>();
+    resources->seed = seed;
+    resources->config = config;
+
+    const randomx_flags flags = baseFlags(config);
+    const bool fast = config.mode == RandomXMode::FAST;
+    resources->vmFlags = fast ? static_cast<randomx_flags>(flags | RANDOMX_FLAG_FULL_MEM) : flags;
+
+    resources->cache = allocWithBacking<randomx_cache>(
+        flags, config.hugePages, kCacheBytes,
+        randomx_alloc_cache, randomx_get_cache_memory, resources->cacheBacking);
+    if (!resources->cache) {
+        return nullptr;
+    }
+    randomx_init_cache(resources->cache, seed.data(), seed.size());
+
+    if (!fast) {
+        return resources;
     }
 
-    initState->cv.notify_all();
+    const unsigned long itemCount = randomx_dataset_item_count();
+    resources->dataset = allocWithBacking<randomx_dataset>(
+        flags, config.hugePages, static_cast<size_t>(itemCount) * RANDOMX_DATASET_ITEM_SIZE,
+        randomx_alloc_dataset, randomx_get_dataset_memory, resources->datasetBacking);
+    if (!resources->dataset) {
+        return nullptr;
+    }
 
+    const uint32_t numThreads = std::max<uint32_t>(1, config.threads);
+    randomx_dataset* dataset = resources->dataset;
+    randomx_cache* cache = resources->cache;
+    auto initChunk = [=](uint32_t i) {
+        const unsigned long start = itemCount * i / numThreads;
+        const unsigned long end = itemCount * (i + 1) / numThreads;
+        randomx_init_dataset(dataset, cache, start, end - start);
+    };
+    // Chunk 0, and any chunk whose thread can't be started (thread limits), runs here: an
+    // exception escaping a libuv worker would abort the process.
+    std::vector<std::thread> initThreads;
+    uint32_t spawned = 1;
+    try {
+        initThreads.reserve(numThreads - 1);
+        for (; spawned < numThreads; spawned++) {
+            initThreads.emplace_back(initChunk, spawned);
+        }
+    } catch (const std::exception&) {
+    }
+    for (uint32_t i = spawned; i < numThreads; i++) {
+        initChunk(i);
+    }
+    initChunk(0);
+    for (auto& thread : initThreads) {
+        thread.join();
+    }
+
+    // Fast-mode VMs never read the cache; keep only the dataset (~256 MB less per seed).
+    randomx_release_cache(resources->cache);
+    resources->cache = nullptr;
+    resources->cacheBacking = MemoryBacking::NONE; // report memory held, not memory once used
     return resources;
 }

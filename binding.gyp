@@ -54,7 +54,6 @@
     },
     {
       "target_name": "randomx",
-      "dependencies": ["build_randomx"],
       "sources": [
         "src/randomx.cpp",
         "src/share_verifier.cpp",
@@ -70,9 +69,10 @@
       ],
       "defines": [
         "NAPI_DISABLE_CPP_EXCEPTIONS",
-        "RANDOMX_HAVE_JIT",
-        "RANDOMX_HAVE_AES"
+        "RANDOMX_COMMIT=\"<!(node -p \"require('./package.json').randomx.commit\")\""
       ],
+      "cflags!": ["-fno-exceptions"],
+      "cflags_cc!": ["-fno-exceptions"],
       "cflags_cc": [
         "-std=c++17",
         "-O3",
@@ -86,18 +86,13 @@
       "conditions": [
         ["OS=='linux'", {
           "cflags_cc": [
-            "-mavx2",
-            "-maes",
             "-pthread"
           ],
           "link_settings": {
             "libraries": [
               "-lpthread"
             ]
-          },
-          "defines": [
-            "RANDOMX_HAVE_HUGE_PAGES"
-          ]
+          }
         }],
         ["OS=='win'", {
           "libraries": [
@@ -105,16 +100,15 @@
           ],
           "msvs_settings": {
             "VCCLCompilerTool": {
-              "AdditionalOptions": ["/arch:AVX2"]
+              "AdditionalOptions": ["/arch:AVX2"],
+              "ExceptionHandling": 1
             }
           }
         }],
         ["OS=='mac'", {
           "xcode_settings": {
-            "OTHER_CPLUSPLUSFLAGS": [
-              "-mavx2",
-              "-maes"
-            ]
+            "OTHER_CPLUSPLUSFLAGS": ["-std=c++17"],
+            "GCC_ENABLE_CPP_EXCEPTIONS": "YES"
           }
         }]
       ]

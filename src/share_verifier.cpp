@@ -1,196 +1,89 @@
 /**
  * Share Verifier Implementation
- * High-performance mining share verification
+ * RandomX hash / PoW computation and share checks
  */
 
 #include "share_verifier.h"
-#include "context_manager.h"
 #include <chrono>
-#include <cstring>
 #include <cmath>
+#include <cstring>
 #include <limits>
-#include <mutex>
 
-extern "C" {
-    #include "randomx.h"
+bool ShareVerifier::compute(
+    const std::shared_ptr<RandomXContext>& context,
+    RandomXVariant variant,
+    const uint8_t* input,
+    size_t inputLength,
+    uint8_t* hash,
+    uint8_t* pow
+) {
+    // Never let an exception (bad_alloc creating the pool) escape into N-API or a libuv worker.
+    std::shared_ptr<RandomXVmPool> pool;
+    try {
+        pool = context->pool(variant);
+    } catch (const std::exception&) {
+        return false;
+    }
+    RandomXVmLease lease(std::move(pool));
+    if (!lease.get()) {
+        return false;
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    randomx_calculate_hash(lease.get(), input, inputLength, hash);
+    const auto t1 = std::chrono::steady_clock::now();
+    ContextManager::getInstance().recordHash(
+        variant, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()));
+
+    if (pow) {
+        if (variant == RandomXVariant::RX2) {
+            randomx_calculate_commitment(input, inputLength, hash, pow);
+        } else {
+            std::memcpy(pow, hash, RANDOMX_HASH_SIZE);
+        }
+    }
+    return true;
 }
 
-/**
- * Verify a mining share
- */
 bool ShareVerifier::verifyShare(
-    uint32_t contextId,
+    const std::shared_ptr<RandomXContext>& context,
+    RandomXVariant variant,
     const uint8_t* input,
     size_t inputLength,
     const uint8_t* target,
-    const uint8_t* expectedHash,
+    const uint8_t* expected,
     ShareVerificationResult& result
 ) {
     result = {};
 
-    // Get RandomX context
-    auto context = ContextManager::getInstance().getContext(contextId);
-    if (!context || !context->vm) {
+    const auto startTime = std::chrono::steady_clock::now();
+    if (!compute(context, variant, input, inputLength, result.hash, result.pow)) {
         return false;
     }
-
-    auto startTime = std::chrono::high_resolution_clock::now();
-
-    // Calculate hash
-    if (!calculateHash(context, contextId, input, inputLength, result.hash)) {
-        return false;
-    }
-
-    // Record timing
-    auto endTime = std::chrono::high_resolution_clock::now();
     result.hashTime = std::chrono::duration_cast<std::chrono::microseconds>(
-        endTime - startTime).count() / 1000.0;
+        std::chrono::steady_clock::now() - startTime).count() / 1000.0;
 
-    // Calculate difficulty
-    result.difficulty = calculateDifficulty(result.hash);
+    result.difficulty = calculateDifficulty(result.pow);
+    result.valid = meetsTarget(result.pow, target) &&
+        (!expected || std::memcmp(result.pow, expected, RANDOMX_HASH_SIZE) == 0);
 
-    // Check if hash meets target
-    result.valid = meetsTarget(result.hash, target);
-
-    // Verify against expected hash if provided
-    if (expectedHash && result.valid) {
-        result.valid = (memcmp(result.hash, expectedHash, 32) == 0);
-    }
-
-    // Record verification for performance tracking
-    ContextManager::getInstance().recordVerification(contextId);
-
+    ContextManager::getInstance().recordVerification();
     return true;
 }
 
-/**
- * Calculate RandomX hash
- */
-bool ShareVerifier::calculateHash(
-    uint32_t contextId,
-    const uint8_t* input,
-    size_t inputLength,
-    uint8_t* output
-) {
-    auto context = ContextManager::getInstance().getContext(contextId);
-    if (!context || !context->vm) {
-        return false;
+double ShareVerifier::calculateDifficulty(const uint8_t* pow) {
+    double value = 0.0;
+    for (int i = RANDOMX_HASH_SIZE - 1; i >= 0; --i) {
+        value = value * 256.0 + pow[i];
     }
-
-    return calculateHash(context, contextId, input, inputLength, output);
+    return value == 0.0 ? std::numeric_limits<double>::infinity() : std::ldexp(1.0, 256) / value;
 }
 
-bool ShareVerifier::calculateHash(
-    const std::shared_ptr<RandomXContext>& context,
-    uint32_t contextId,
-    const uint8_t* input,
-    size_t inputLength,
-    uint8_t* output
-) {
-    if (!context || !context->vm) {
-        return false;
+bool ShareVerifier::meetsTarget(const uint8_t* pow, const uint8_t* target) {
+    for (int i = RANDOMX_HASH_SIZE - 1; i >= 0; --i) {
+        if (pow[i] != target[i]) {
+            return pow[i] < target[i];
+        }
     }
-
-    std::lock_guard<std::mutex> lock(context->hashMutex);
-
-    auto t0 = std::chrono::high_resolution_clock::now();
-    randomx_calculate_hash(context->vm, input, inputLength, output);
-    auto t1 = std::chrono::high_resolution_clock::now();
-    const uint64_t micros = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
-
-    ContextManager::getInstance().recordHash(contextId, micros);
-
     return true;
-}
-
-/**
- * Calculate difficulty from hash
- */
-double ShareVerifier::calculateDifficulty(const uint8_t* hash) {
-    // Convert hash to big integer for calculation
-    uint8_t hashBigInt[32];
-    hashToBigInt(hash, hashBigInt);
-
-    // Find the most significant non-zero byte
-    int msbIndex = -1;
-    for (int i = 0; i < 32; ++i) {
-        if (hashBigInt[i] != 0) {
-            msbIndex = i;
-            break;
-        }
-    }
-
-    if (msbIndex == -1) {
-        // Hash is zero, maximum difficulty
-        return std::numeric_limits<double>::infinity();
-    }
-
-    // Calculate difficulty based on leading zeros and MSB value
-    int leadingZeros = msbIndex * 8;
-    uint8_t msbValue = hashBigInt[msbIndex];
-
-    // Count leading zeros in the MSB
-    int msbLeadingZeros = 0;
-    for (int i = 7; i >= 0; --i) {
-        if ((msbValue >> i) & 1) {
-            break;
-        }
-        msbLeadingZeros++;
-    }
-
-    leadingZeros += msbLeadingZeros;
-
-    // Calculate difficulty: 2^(256 - leading_zeros) / (remaining_bits)
-    double difficulty = std::pow(2.0, 256 - leadingZeros);
-
-    // Adjust for remaining bits precision
-    if (msbLeadingZeros < 8) {
-        uint16_t remainingBits = msbValue << msbLeadingZeros;
-        if (msbIndex + 1 < 32) {
-            remainingBits |= (hashBigInt[msbIndex + 1] >> (8 - msbLeadingZeros));
-        }
-        difficulty /= (remainingBits + 1);
-    }
-
-    return difficulty;
-}
-
-/**
- * Check if hash meets target difficulty
- */
-bool ShareVerifier::meetsTarget(const uint8_t* hash, const uint8_t* target) {
-    // Convert both hash and target to big integers
-    uint8_t hashBigInt[32];
-    uint8_t targetBigInt[32];
-
-    hashToBigInt(hash, hashBigInt);
-    hashToBigInt(target, targetBigInt);
-
-    // Compare: hash should be <= target
-    return compareBigInt(hashBigInt, targetBigInt) <= 0;
-}
-
-/**
- * Convert hash to big integer (little-endian to big-endian)
- */
-void ShareVerifier::hashToBigInt(const uint8_t* hash, uint8_t* result) {
-    // RandomX produces little-endian hash, convert to big-endian for comparison
-    for (int i = 0; i < 32; ++i) {
-        result[i] = hash[31 - i];
-    }
-}
-
-/**
- * Compare two big integers (big-endian)
- */
-int ShareVerifier::compareBigInt(const uint8_t* a, const uint8_t* b) {
-    for (int i = 0; i < 32; ++i) {
-        if (a[i] < b[i]) {
-            return -1;
-        } else if (a[i] > b[i]) {
-            return 1;
-        }
-    }
-    return 0; // Equal
 }

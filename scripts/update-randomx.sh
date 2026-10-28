@@ -13,6 +13,7 @@
 #   1. node-gyp build of the addon against REF
 #   2. v1 hash vectors from the new build must equal the current build/Release (consensus check)
 #   3. upstream randomx-tests (includes RandomX v2 and commitment vectors)
+#   4. this repo's test suite (npm test: known-answer vectors for rx/0 + rx/2, seed pool, API)
 # Only then is REF merged with `git subtree merge --squash`.
 #
 # Env: RANDOMX_UPSTREAM (default https://github.com/tevador/RandomX)
@@ -80,6 +81,16 @@ else
     info "Warning: target is not a descendant of the current commit (downgrade or different branch)"
 fi
 
+set_package_commit() {
+    node -e '
+        const fs = require("fs");
+        const [file, commit, date] = process.argv.slice(1);
+        const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+        pkg.randomx = { commit, date };
+        fs.writeFileSync(file, JSON.stringify(pkg, null, 4) + "\n");
+    ' "$1" "$target" "$(git log -1 --format=%ad --date=short "$target")"
+}
+
 if [ "$CHECK_ONLY" -eq 1 ]; then
     exit 2
 fi
@@ -95,6 +106,7 @@ if [ "$VERIFY" -eq 1 ]; then
     git archive HEAD | tar -x -C "$tmp"
     rm -rf "$tmp/$PREFIX" && mkdir -p "$tmp/$PREFIX"
     git archive "$target" | tar -x -C "$tmp/$PREFIX"
+    set_package_commit "$tmp/package.json"
     ln -s "$PWD/node_modules" "$tmp/node_modules"
 
     if ! (cd "$tmp" && npx --yes node-gyp rebuild >build.log 2>&1); then
@@ -106,7 +118,8 @@ if [ "$VERIFY" -eq 1 ]; then
     vectors="$tmp/vectors.js"
     cat >"$vectors" <<'EOF'
 const crypto = require('crypto');
-const rx = require(process.argv[2]);
+// Native binding directly: its initContext/hash signatures are stable across addon ABI versions.
+const rx = require(require('path').join(process.argv[2], 'build/Release/randomx.node'));
 const seed = Buffer.from('randomx-hashing update check'.padEnd(32, '\0'));
 const cases = [['light', true, 200], ['light', false, 200], ['fast', true, 2000]];
 for (const [mode, enableJit, count] of cases) {
@@ -146,8 +159,8 @@ EOF
         tail -3 "$tmp/randomx-tests.log" | sed 's/^/    /'
     fi
 
-    info "Running test/test.js"
-    (cd "$tmp" && node test/test.js >test.log 2>&1) || { keep_tmp=1; tail -20 "$tmp/test.log" >&2; die "test/test.js failed; log kept at $tmp/test.log"; }
+    info "Running npm test"
+    (cd "$tmp" && npm test --silent >test.log 2>&1) || { keep_tmp=1; tail -20 "$tmp/test.log" >&2; die "npm test failed; log kept at $tmp/test.log"; }
 fi
 
 info "Merging ${target:0:7} into $PREFIX"
@@ -155,6 +168,10 @@ git subtree merge --prefix "$PREFIX" --squash "$target" -m ":arrow_up: Update Ra
 
   - upstream: $UPSTREAM ($REF)
   - previous: ${current:0:7}
-  - verified: $([ "$VERIFY" -eq 1 ] && echo "build, v1 vectors unchanged, randomx-tests, test/test.js" || echo "skipped (--no-verify)")"
+  - verified: $([ "$VERIFY" -eq 1 ] && echo "build, v1 vectors unchanged, randomx-tests, npm test" || echo "skipped (--no-verify)")"
+
+# Record the commit for capabilities().randomx (compiled in from package.json by binding.gyp).
+set_package_commit package.json
+git commit --amend --no-edit --quiet -- package.json
 
 info "Done. Rebuild in place with 'npm run build' (restart any process that has the addon loaded)."

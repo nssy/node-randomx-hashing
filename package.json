@@ -1,6 +1,6 @@
 {
     "name": "randomx-hashing",
-    "version": "1.1.2",
+    "version": "2.0.0",
     "description": "High-performance RandomX share verifier for Node.js mining pools",
     "main": "index.js",
     "files": [
@@ -14,7 +14,7 @@
         "examples/"
     ],
     "scripts": {
-        "test": "node test/test.js",
+        "test": "node test/vectors.test.js && node test/seedpool.test.js && node test/test.js",
         "test:fast-mode": "node test/fast-mode.test.js",
         "build": "npm rebuild --foreground-scripts",
         "clean": "rm -rf build deps/randomx/build",
@@ -43,6 +43,10 @@
     },
     "engines": {
         "node": ">=12.0.0"
+    },
+    "randomx": {
+        "commit": "ff6daa17fde3bb9032bbad15db16cad908deaee0",
+        "date": "2026-10-25"
     },
     "gypfile": true,
     "binary": {
