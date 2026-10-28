@@ -17,7 +17,7 @@ That maps much better to real pool workloads than making application code manage
 - **Pool Broker Friendly**: Works well behind a local socket broker shared by many pool workers
 - **Pool-Ready**: Designed specifically for mining pool server workloads
 - **Cross-Platform**: Supports Linux, Windows, and macOS
-- **Vendored RandomX Source**: Builds from pinned local RandomX source in `deps/randomx`
+- **Vendored RandomX Source**: Builds from upstream RandomX pinned as a git subtree in `deps/randomx` (see [Updating RandomX](#updating-randomx))
 
 ## Performance
 
@@ -374,6 +374,38 @@ npm test
 npm run clean
 ```
 
+### Updating RandomX
+
+`deps/randomx` is a squashed [git subtree](https://github.com/tevador/RandomX), not a submodule:
+npm installs `github:` dependencies from GitHub tarballs, which never contain submodule files.
+The pinned upstream commit is recorded in the subtree commit (`git-subtree-split: <sha>`).
+
+Use the update script instead of copying files by hand:
+
+```bash
+# Show the pinned vs. latest upstream commit and what changed (exit code 2 = update available)
+npm run update-randomx -- --check
+
+# Update to upstream master (or pass a branch, tag or full commit SHA)
+npm run update-randomx
+npm run update-randomx -- <ref>
+
+# Then rebuild in place and restart anything that has the addon loaded
+npm run build
+```
+
+Before committing anything, the script builds the addon against the new RandomX in a temporary
+export, so your working tree and `build/Release` stay untouched until every check passes:
+
+- v1 hashes from the new build must be identical to your current `build/Release` (consensus check)
+- upstream `randomx-tests` must pass (includes RandomX v2 and commitment vectors)
+- `test/test.js` must pass
+
+It then merges the update as one squashed subtree commit. Run it on a clean branch: tracked
+files must have no uncommitted changes. It refuses targets older than upstream `7c761cf`, which
+fixes wrong RandomX v2 code generation in the x86 JIT (present in the `v2.0.1` tag).
+`--no-verify` skips the checks.
+
 ### Automated Build Features
 
 The build system includes several automated features:
@@ -381,7 +413,7 @@ The build system includes several automated features:
 - **Vendored Source Check**: Fails fast if the package is incomplete and `deps/randomx` is missing
 - **Dependency Detection**: Automatically checks for cmake and build tools
 - **Platform Detection**: Handles Linux, Windows, macOS differences automatically
-- **Version Pinning**: Uses the pinned vendored RandomX revision
+- **Version Pinning**: Uses the RandomX revision pinned by the `deps/randomx` git subtree
 - **Error Handling**: Clear error messages for missing dependencies
 - **Incremental Builds**: Only rebuilds what's necessary
 

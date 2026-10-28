@@ -19,7 +19,8 @@
         "build": "npm rebuild --foreground-scripts",
         "clean": "rm -rf build deps/randomx/build",
         "example": "node examples/pool-server.js",
-        "verify": "node scripts/verify-installation.js"
+        "verify": "node scripts/verify-installation.js",
+        "update-randomx": "scripts/update-randomx.sh"
     },
     "keywords": [
         "randomx",
