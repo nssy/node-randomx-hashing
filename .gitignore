@@ -10,7 +10,7 @@ build/
 
 # Dependencies
 node_modules/
-deps/
+deps/*
 !deps/randomx/
 !deps/randomx/**
 deps/randomx/build/
