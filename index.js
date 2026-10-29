@@ -90,6 +90,12 @@ function assertInput(input) {
     }
 }
 
+function seedPoolError(code, message) {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+}
+
 function seedFromHex(seedHex) {
     if (typeof seedHex !== 'string' || seedHex.length !== 64) {
         throw new Error('seedHex must be a 64-character hex string (32 bytes)');
@@ -188,16 +194,19 @@ class SeedPool {
     /**
      * @param {number} maxSeeds
      * @param {Object} initOptions options passed to initContext for every new seed
-     * @param {number|null} [idleEvictMs] if set, release seeds not hashed for this many ms (frees RAM);
-     *   seeds that were only warmed are kept until first use or LRU displacement
+     * @param {number|null} [idleEvictMs] release older used seeds idle for this many ms;
+     *   an explicitly protected seed (otherwise latest used) and never-used warmups survive
      * @param {number} [vmPoolSize] max VMs per variant per seed
      */
     constructor(maxSeeds, initOptions, idleEvictMs = null, vmPoolSize = 1) {
         this.maxSeeds = readCount('maxSeeds', maxSeeds, 2);
         this._vmPoolSize = readCount('vmPoolSize', vmPoolSize, 1);
         this._initOptions = normalizeInitOptions({ ...initOptions, vmPoolSize: this._vmPoolSize });
-        /** @type {Map<string, { contextId: number, lastUsed: number, used: boolean }>} */
+        /** @type {Map<string, { contextId: number, lastUsed: number, used: boolean, useOrder: number }>} */
         this._lru = new Map();
+        this._useSequence = 0;
+        this._latestUsedSeed = null;
+        this._protectedSeed = null;
         /** @type {Map<string, { promise: Promise<void>, cancelled: boolean }>} */
         this._pendingWarmups = new Map();
         this._destroyed = false;
@@ -218,6 +227,10 @@ class SeedPool {
     _touch(key, use = true) {
         const entry = this._lru.get(key);
         if (entry) {
+            if (use) {
+                this._latestUsedSeed = key;
+                entry.useOrder = ++this._useSequence;
+            }
             entry.lastUsed = Date.now();
             entry.used = entry.used || use;
             this._lru.delete(key);
@@ -228,9 +241,24 @@ class SeedPool {
 
     _insert(key, contextId, used) {
         while (this._lru.size >= this.maxSeeds) {
-            this._releaseKey(this._lru.keys().next().value);
+            let evict = null;
+            for (const candidate of this._lru.keys()) {
+                if (candidate !== this._protectedSeed) {
+                    evict = candidate;
+                    break;
+                }
+            }
+            // maxSeeds remains a hard bound: with maxSeeds=1 there is no alternative to
+            // displacing the protected seed when another seed is inserted.
+            this._releaseKey(evict || this._lru.keys().next().value);
         }
-        this._lru.set(key, { contextId, lastUsed: Date.now(), used });
+        this._lru.set(key, {
+            contextId,
+            lastUsed: Date.now(),
+            used,
+            useOrder: used ? ++this._useSequence : 0
+        });
+        if (used) this._latestUsedSeed = key;
         this._startSweep();
     }
 
@@ -240,6 +268,18 @@ class SeedPool {
             return false;
         }
         this._lru.delete(key);
+        if (this._latestUsedSeed === key) {
+            let latestKey = null;
+            let latestOrder = 0;
+            for (const [candidate, candidateEntry] of this._lru) {
+                if (candidateEntry.useOrder > latestOrder) {
+                    latestKey = candidate;
+                    latestOrder = candidateEntry.useOrder;
+                }
+            }
+            this._latestUsedSeed = latestKey;
+        }
+        if (this._protectedSeed === key) this._protectedSeed = null;
         randomx.releaseContext(entry.contextId);
         return true;
     }
@@ -265,11 +305,15 @@ class SeedPool {
      * traffic. A seed that was warmed but never hashed is kept (maxSeeds still bounds it): Monero
      * publishes next_seed_hash ~64 blocks (~2 h) before the switch, longer than a typical idle
      * window, and evicting the prewarmed dataset would make every epoch switch cold.
+     * Keep the explicitly protected seed, or otherwise the latest seed used for hashing/context
+     * access: idle eviction reclaims old transition seeds, not the quiet pool's current verifier.
+     * Explicit release and the maxSeeds bound still apply. Warmups do not change the identity.
      */
     _expireIdle() {
         const cutoff = Date.now() - this._idleEvictMs;
+        const protectedSeed = this._protectedSeed || this._latestUsedSeed;
         for (const [key, entry] of this._lru) {
-            if (entry.used && entry.lastUsed < cutoff) {
+            if (entry.used && key !== protectedSeed && entry.lastUsed < cutoff) {
                 this._releaseKey(key);
             }
         }
@@ -284,6 +328,17 @@ class SeedPool {
             pending.cancelled = true;
             this._pendingWarmups.delete(key);
         }
+    }
+
+    _beginProtection(key) {
+        const previous = this._protectedSeed;
+        // A superseded current-seed build must not finish later and LRU-evict the newer current
+        // seed, especially when maxSeeds is 1.
+        if (this.maxSeeds === 1 && previous && previous !== key && !this._lru.has(previous)) {
+            this._cancelPendingWarmup(previous);
+        }
+        this._protectedSeed = key;
+        return previous;
     }
 
     /**
@@ -311,21 +366,24 @@ class SeedPool {
     }
 
     /**
-     * Run `fn(contextId)` for a seed, warming it on the worker pool when missing. Never blocks the
-     * event loop. `fn` runs in the same tick as the lookup, so a release in between can't turn a
-     * queued hash into "Invalid context" (native work keeps its context alive once started).
+     * Run `fn(contextId)` for a seed, warming it once on the worker pool when missing. Never
+     * blocks the event loop. `fn` runs in the same tick as the final lookup, so a release in
+     * between can't turn a queued hash into "Invalid context" (native work keeps its context
+     * alive once started).
      */
     async _withContextAsync(seed, fn) {
         const key = seed.toString('hex');
-        for (let attempt = 0; attempt < 2; attempt++) {
-            this._assertAlive();
-            const entry = this._touch(key);
-            if (entry) {
-                return fn(entry.contextId);
-            }
+        this._assertAlive();
+        let entry = this._touch(key);
+        if (!entry) {
             await this.warmSeedAsync(seed);
+            this._assertAlive();
+            entry = this._touch(key);
         }
-        throw new Error('Seed was released while warming up');
+        if (!entry) {
+            throw seedPoolError('ERR_RANDOMX_SEED_RELEASED', 'Seed was released while warming up');
+        }
+        return fn(entry.contextId);
     }
 
     /**
@@ -441,6 +499,64 @@ class SeedPool {
         return this.warmSeedAsync(seedFromHex(seedHex));
     }
 
+    /**
+     * Warm and explicitly protect the pool's current seed. Unlike the latest-used fallback, a
+     * later hash on an old job does not change this identity. Idle eviction keeps it, and LRU
+     * displacement chooses another seed when possible; maxSeeds remains the hard memory bound.
+     * This synchronous form can block while initializing a missing seed.
+     */
+    protectSeed(seed) {
+        assertSeed(seed);
+        this._assertAlive();
+        const key = seed.toString('hex');
+        const previous = this._beginProtection(key);
+        try {
+            this._getContextSync(seed, false);
+        } catch (error) {
+            if (this._protectedSeed === key) {
+                this._protectedSeed = previous && this._lru.has(previous) ? previous : null;
+            }
+            throw error;
+        }
+    }
+
+    protectSeedFromHex(seedHex) {
+        return this.protectSeed(seedFromHex(seedHex));
+    }
+
+    /** Worker-pool form of protectSeed(); preferred by servers and mining pools. */
+    async protectSeedAsync(seed) {
+        assertSeed(seed);
+        this._assertAlive();
+        const key = seed.toString('hex');
+        const previous = this._beginProtection(key);
+        try {
+            await this.warmSeedAsync(seed);
+            this._assertAlive();
+            if (this._protectedSeed !== key) {
+                if (this._protectedSeed) {
+                    throw seedPoolError(
+                        'ERR_RANDOMX_PROTECTION_SUPERSEDED',
+                        'Seed protection was superseded by a newer seed'
+                    );
+                }
+                throw seedPoolError('ERR_RANDOMX_SEED_RELEASED', 'Protected seed was released while warming up');
+            }
+            if (!this._touch(key, false)) {
+                throw seedPoolError('ERR_RANDOMX_SEED_RELEASED', 'Protected seed was released while warming up');
+            }
+        } catch (error) {
+            if (this._protectedSeed === key) {
+                this._protectedSeed = previous && this._lru.has(previous) ? previous : null;
+            }
+            throw error;
+        }
+    }
+
+    protectSeedAsyncFromHex(seedHex) {
+        return this.protectSeedAsync(seedFromHex(seedHex));
+    }
+
     /** Sync verification; initializes a missing seed synchronously. */
     verifyShare(seed, input, target, expectedPow = null, options) {
         assertInput(input);
@@ -480,6 +596,8 @@ class SeedPool {
         assertSeed(seed);
         const key = seed.toString('hex');
         this._cancelPendingWarmup(key);
+        // A pending protect has no LRU entry for _releaseKey() to clear yet.
+        if (this._protectedSeed === key) this._protectedSeed = null;
         return this._releaseKey(key);
     }
 
@@ -500,6 +618,8 @@ class SeedPool {
         for (const key of [...this._lru.keys()]) {
             this._releaseKey(key);
         }
+        this._latestUsedSeed = null;
+        this._protectedSeed = null;
     }
 
     get size() {
@@ -510,12 +630,15 @@ class SeedPool {
      * Introspection for logging (truncated seeds).
      */
     getSnapshot() {
+        const idleProtectedSeed = this._protectedSeed || this._latestUsedSeed;
         const seeds = [...this._lru].map(([key, entry]) => {
             const info = randomx.getContextInfo(entry.contextId);
             return {
                 seed: `${key.slice(0, 16)}…`,
                 lastUsed: entry.lastUsed,
                 used: entry.used,
+                protected: key === this._protectedSeed,
+                idleProtected: key === idleProtectedSeed,
                 vms: info ? info.vms : null,
                 memory: info ? info.memory : null
             };
@@ -525,6 +648,8 @@ class SeedPool {
             maxSeeds: this.maxSeeds,
             vmPoolSize: this._vmPoolSize,
             idleEvictMs: this._idleEvictMs,
+            protectedSeed: this._protectedSeed ? `${this._protectedSeed.slice(0, 16)}…` : null,
+            idleProtectedSeed: idleProtectedSeed ? `${idleProtectedSeed.slice(0, 16)}…` : null,
             seedPrefixes: seeds.map((s) => s.seed),
             seeds
         };
@@ -545,8 +670,8 @@ class SeedPool {
  * @param {boolean} [options.enableJit]
  * @param {boolean} [options.enableAes]
  * @param {boolean|string} [options.enableHugePages] true (default), 'thp' (no reserved pages) or false
- * @param {number} [options.idleEvictMs] release seeds not hashed for this long (ms) to reclaim RAM;
- *   a warmed seed that was never hashed is kept until first use (or LRU displacement)
+ * @param {number} [options.idleEvictMs] release older used seeds idle for this long (ms);
+ *   an explicitly protected seed (otherwise latest used) and never-used warmups survive
  * @returns {SeedPool}
  */
 function createSeedPool(options = {}) {
@@ -561,8 +686,8 @@ function createSeedPool(options = {}) {
 }
 
 /**
- * LRU cache sized for Monero-style RandomX epochs: at most two `seed_hash`
- * values are needed (current + previous block template) during a fork/transition.
+ * LRU cache sized for Monero-style RandomX epochs: two `seed_hash` values cover the protected
+ * current seed plus an adjacent transition seed (previous work or a prewarmed next seed).
  * Same as {@link createSeedPool} with `maxSeeds: 2` by default.
  *
  * @param {Object} [options] forwarded to {@link createSeedPool}; `maxSeeds` defaults to 2

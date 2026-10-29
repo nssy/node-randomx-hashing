@@ -25,7 +25,8 @@ That maps much better to real pool workloads than making application code manage
 - **AES Hardware**: Hardware-accelerated AES when available
 - **Memory Optimization**: Shared seed resources; huge pages by default with automatic fallback
 - **RandomX v2 ready**: `rx/0` and `rx/2` per call, sharing one dataset per seed
-- **Seed Reuse**: Current/previous `seed_hash` values stay warm without rebuilding full datasets
+- **Seed Reuse**: Explicitly protect the current `seed_hash` and reuse cached resources for an
+  adjacent previous or prewarmed next seed without rebuilding full datasets
 - **Async Hashing**: `hashAsync()` lets Node brokers overlap requests without blocking the event loop
 
 ## Installation
@@ -71,7 +72,7 @@ npm install
 ```javascript
 const randomx = require('randomx-hashing');
 
-// Primary API: a seed pool for current + previous seed_hash
+// Primary API: a seed pool for the current + adjacent transition seed_hash
 const pool = randomx.createPoolSeedPool({
     maxSeeds: 2,
     vmPoolSize: 2,          // max concurrent VMs per variant per seed
@@ -83,7 +84,7 @@ const pool = randomx.createPoolSeedPool({
 const seed = Buffer.alloc(32, 1);
 const blob = Buffer.from('hashing blob with nonce');
 
-await pool.warmSeedAsync(seed);
+await pool.protectSeedAsync(seed); // current seed; warmSeedAsync(nextSeed) prewarms the next one
 
 // Pick the variant per job from the block major version (Monero v17+ = RandomX v2)
 const variant = randomx.getVariant(blob);
@@ -135,6 +136,8 @@ Huge pages are **on by default** and every buffer falls back on its own:
   for the dataset.
 - **Reserved hugetlb pages** are used only when the kernel's default huge page size is 2 MiB and
   enough pages are available (free minus reserved). 1 GiB pages are never used.
+- In fast mode the long-lived dataset is allocated before its temporary initialization cache, so
+  a constrained reserved pool prioritizes the memory that affects steady-state hash performance.
 - **Transparent huge pages** are requested with `madvise(MADV_HUGEPAGE)` before the memory is
   first touched, when THP is `always` or `madvise`.
 - `enableHugePages: 'thp'` uses transparent huge pages only and leaves the reserved pool to other
@@ -170,7 +173,7 @@ working. Log `getMemoryInfo(seed)` once per seed to see which (`examples/memory-
 ### `createSeedPool(options)` / `createPoolSeedPool(options)`
 
 Primary high-level API for pools and brokers. `createPoolSeedPool` defaults `maxSeeds` to 2
-(current + previous seed).
+(protected current + one adjacent transition seed).
 
 Count options must be positive integers: other numbers (`NaN`, `±Infinity`, fractions, `0`,
 negatives) and other types throw a `RangeError`. Values above a cap are lowered to it with a
@@ -186,7 +189,7 @@ never resolve to context 1.
 - `threads` (integer, default half the CPUs, capped at the CPU count): dataset init threads; leaves cores for live hashing during a seed change
 - `enableJit`, `enableAes` (boolean, default `true`)
 - `enableHugePages` (`true` | `'thp'` | `false`, default `true`): see [Memory and huge pages](#memory-and-huge-pages)
-- `idleEvictMs` (number of ms; unset or `0` disables): release seeds not hashed for this many ms, checked on a timer (memory is freed without traffic). A seed that was only warmed is kept until its first hash (or LRU displacement), so prewarming `next_seed_hash` ~2 h before the epoch switch survives a shorter idle window
+- `idleEvictMs` (number of ms; unset or `0` disables): release older used seeds idle for this many ms, checked on a timer. `protectSeedAsync()` identifies the current seed explicitly; without it, the latest seed used for hashing/context access is protected. Never-used prewarmed seeds also survive. The `maxSeeds` hard bound and explicit release still apply. This reclaims previous-epoch memory after transitions without making a quiet pool cold.
 
 **Returns:** `SeedPool`
 
@@ -199,7 +202,14 @@ seed also has a `...FromHex(seedHex, ...)` form, except `has` and `getMemoryInfo
 - `hash(seed, input, options?)` / `pow(seed, input, options?)`: sync forms
 - `verifyShare(seed, input, target, expectedPow?, options?)`: sync
 - `warmSeedAsync(seed)` / `warmSeed(seed)`: build a seed's cache/dataset (variants need no warmup)
-- `getMemoryInfo(seed)`, `getSnapshot()`, `has(seed)`, `size`
+- `protectSeedAsync(seed)` / `protectSeed(seed)`: warm and identify the current seed; idle
+  eviction keeps it and LRU evicts another seed when possible. A newer protection supersedes an
+  older in-flight async call, whose promise rejects with
+  `code === 'ERR_RANDOMX_PROTECTION_SUPERSEDED'`
+- `getMemoryInfo(seed)`, `getSnapshot()`, `has(seed)`, `size`. The snapshot's
+  `idleProtectedSeed` identifies the seed exempt from idle eviction (explicit protection when set,
+  otherwise the latest used seed); `idleProtected` marks its resident entry. `protectedSeed` and
+  `protected` report explicit protection only.
 - `getContext(seed)` / `getContextFromHex(seedHex)`: context id for the low-level API
 - `release(seed)` / `releaseFromHex(seedHex)` / `releaseAll()`
 
@@ -215,9 +225,9 @@ Notes:
 - `releaseAll()` is a full teardown; the pool rejects further use.
 - **Concurrency is bounded by libuv's thread pool**, 4 threads by default. Async hashes and
   warmups run there, so `vmPoolSize: 16` with the default pool hashes only 4 at a time. Set
-  `UV_THREADPOOL_SIZE` to at least `vmPoolSize + 2` in the environment of the process before it
-  starts: a warmup holds one thread for the whole dataset build, and the current and next seed
-  can warm at once.
+  `UV_THREADPOOL_SIZE` to at least `vmPoolSize + 2` before the process starts, and admit at most
+  `vmPoolSize` native hash calls at once. Otherwise hashes waiting for a VM can occupy the spare
+  workers intended for current/next seed warmup.
 - Errors: invalid arguments (types, sizes, variants, count options) throw synchronously, even
   from async methods. A released pool and failed allocations reject.
 - When memory runs out, a seed that can't be allocated fails with "Failed to initialize RandomX
@@ -324,7 +334,7 @@ taskset -c 0-3 node your-pool-server.js
 class PoolServer {
     constructor() {
         this.contexts = randomx.createPoolSeedPool({
-            maxSeeds: 2,      // current + previous seed_hash
+            maxSeeds: 2,      // protected current + previous or prewarmed next seed_hash
             vmPoolSize: 2,    // up to two VMs per variant share one dataset
             mode: 'fast'
         });
@@ -345,7 +355,8 @@ For real pool deployments, a useful pattern is:
 - keep RandomX in one or a few broker processes
 - let pool workers send hash requests over a local socket
 - use `createPoolSeedPool({ maxSeeds: 2, vmPoolSize: N, mode: 'fast' })`
-- call `seedPool.warmSeedAsync(seed)` when a new `seed_hash` appears so dataset init happens off the main thread
+- call `seedPool.protectSeedAsync(currentSeed)` for the current `seed_hash`, then `warmSeedAsync(nextSeed)` for `next_seed_hash`; this keeps LRU ordering correct even when a quiet pool receives no shares for an epoch
+- admit at most `vmPoolSize` native hash calls per broker process and queue excess requests in JavaScript; native calls waiting for a VM occupy libuv workers, while admission control preserves spare workers for seed warmup
 - call `seedPool.powAsync(seed, input, { variant })` inside the broker so one process can overlap requests
 - pass the job's variant on every request, and check `capabilities()` on both sides so a stale broker can't silently return v1 hashes
 

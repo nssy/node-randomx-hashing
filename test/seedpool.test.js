@@ -38,13 +38,85 @@ test('cold hashAsync warms off the event loop', async () => {
     assert.ok(gap < 50, `event loop blocked for ${gap.toFixed(0)} ms`);
 });
 
-test('idle seeds are released without any traffic', async () => {
+test('latest used seed survives idle time and prewarming', async () => {
     const pool = rx.createPoolSeedPool({ ...light, idleEvictMs: 100 });
     const seed = crypto.randomBytes(32);
     await pool.hashAsync(seed, input);
     assert.strictEqual(pool.size, 1);
     await sleep(300);
-    assert.strictEqual(pool.size, 0, 'idle seed still held');
+    assert.ok(pool.has(seed), 'latest used seed must stay warm');
+    assert.strictEqual(pool.getSnapshot().idleProtectedSeed, `${seed.toString('hex').slice(0, 16)}…`);
+    assert.strictEqual(pool.getSnapshot().seeds[0].idleProtected, true);
+    assert.strictEqual(pool.getSnapshot().seeds[0].protected, false);
+    const next = crypto.randomBytes(32);
+    await pool.warmSeedAsync(next);
+    await sleep(300);
+    assert.ok(pool.has(seed), 'prewarming must not replace the latest used seed');
+    await pool.hashAsync(next, input);
+    await sleep(300);
+    assert.ok(!pool.has(seed), 'previous used seed must expire after transition');
+    assert.ok(pool.has(next), 'new latest used seed must stay warm');
+    assert.ok(pool.release(next), 'explicit release must override idle protection');
+    assert.strictEqual(pool.size, 0);
+    pool.releaseAll();
+});
+
+test('releasing the latest seed restores the previous used fallback', async () => {
+    const pool = rx.createPoolSeedPool({ ...light, maxSeeds: 2, idleEvictMs: 100 });
+    const previous = crypto.randomBytes(32);
+    const latest = crypto.randomBytes(32);
+    await pool.hashAsync(previous, input);
+    await pool.hashAsync(latest, input);
+    await pool.warmSeedAsync(previous); // Move it in LRU order without making it latest-used.
+    assert.ok(pool.release(latest));
+    await sleep(300);
+    assert.ok(pool.has(previous), 'remaining latest-used seed was not promoted after release');
+    pool.releaseAll();
+});
+
+test('an explicitly protected current seed wins over late work and LRU order', async () => {
+    const pool = rx.createPoolSeedPool({ ...light, maxSeeds: 2, idleEvictMs: 100 });
+    const previous = crypto.randomBytes(32);
+    const current = crypto.randomBytes(32);
+    const next = crypto.randomBytes(32);
+
+    await pool.hashAsync(previous, input);
+    await pool.hashAsync(current, input);
+    await pool.protectSeedAsync(current);
+    await pool.hashAsync(previous, input); // late work must not change the explicit identity
+    await sleep(300);
+    assert.ok(!pool.has(previous), 'late previous-seed work displaced the current seed');
+    assert.ok(pool.has(current), 'explicit current seed expired as idle');
+    assert.strictEqual(pool.getSnapshot().seeds[0].protected, true);
+    assert.strictEqual(pool.getSnapshot().seeds[0].idleProtected, true);
+    assert.strictEqual(pool.getSnapshot().idleProtectedSeed, `${current.toString('hex').slice(0, 16)}…`);
+
+    // Recreate the real quiet-epoch order: current was warmed before the last previous share,
+    // then an upcoming seed arrives while maxSeeds is full.
+    await pool.warmSeedAsync(previous);
+    await pool.hashAsync(previous, input);
+    await pool.protectSeedAsync(current);
+    await pool.warmSeedAsync(next);
+    assert.ok(!pool.has(previous), 'LRU retained previous instead of protected current');
+    assert.ok(pool.has(current), 'LRU evicted protected current');
+    assert.ok(pool.has(next), 'next seed was not retained');
+
+    assert.ok(pool.release(current), 'explicit release must override protection');
+    assert.strictEqual(pool.getSnapshot().protectedSeed, null);
+    pool.releaseAll();
+});
+
+test('the maxSeeds bound and sync protection API remain authoritative', async () => {
+    const pool = rx.createPoolSeedPool({ ...light, maxSeeds: 1 });
+    const current = crypto.randomBytes(32);
+    const next = crypto.randomBytes(32);
+    pool.protectSeedFromHex(current.toString('hex'));
+    assert.ok(pool.has(current));
+    assert.strictEqual(pool.getSnapshot().protectedSeed, `${current.toString('hex').slice(0, 16)}…`);
+    await pool.warmSeedAsync(next);
+    assert.ok(!pool.has(current), 'maxSeeds=1 must remain a hard memory bound');
+    assert.ok(pool.has(next));
+    assert.strictEqual(pool.getSnapshot().protectedSeed, null);
     pool.releaseAll();
 });
 
@@ -58,7 +130,7 @@ test('a prewarmed seed waits for its first hash', async () => {
     assert.strictEqual(pool.getSnapshot().seeds[0].used, false);
     await pool.hashAsync(next, input);
     await sleep(300);
-    assert.ok(!pool.has(next), 'seed kept after use went idle');
+    assert.ok(pool.has(next), 'latest used seed must survive idle time');
     pool.releaseAll();
 });
 
@@ -81,12 +153,113 @@ test('releaseAll rejects new work and drops in-flight warmups', async () => {
     const pool = rx.createPoolSeedPool(light);
     const before = rx.getStats().activeContexts;
     const warming = pool.warmSeedAsync(crypto.randomBytes(32));
+    const protecting = assert.rejects(pool.protectSeedAsync(crypto.randomBytes(32)), /released/);
     pool.releaseAll();
     await warming;
+    await protecting;
     assert.strictEqual(pool.size, 0);
+    assert.strictEqual(pool.getSnapshot().protectedSeed, null);
     assert.strictEqual(rx.getStats().activeContexts, before, 'context leaked after releaseAll');
     await assert.rejects(pool.warmSeedAsync(crypto.randomBytes(32)), /released/);
+    await assert.rejects(pool.protectSeedAsync(crypto.randomBytes(32)), /released/);
     await assert.rejects(pool.hashAsync(crypto.randomBytes(32), input), /released/);
+});
+
+test('release cancels pending protection immediately', async () => {
+    const pool = rx.createPoolSeedPool(light);
+    const seed = crypto.randomBytes(32);
+    const protecting = pool.protectSeedAsync(seed);
+    assert.ok(pool.getSnapshot().protectedSeed, 'pending protection was not visible');
+    assert.strictEqual(pool.release(seed), false, 'pending seed must not claim a resident release');
+    assert.strictEqual(pool.getSnapshot().protectedSeed, null, 'release left pending protection set');
+    await assert.rejects(protecting, (error) => {
+        assert.strictEqual(error.code, 'ERR_RANDOMX_SEED_RELEASED');
+        return /released while warming/.test(error.message);
+    });
+    assert.strictEqual(pool.size, 0);
+    pool.releaseAll();
+});
+
+test('release cancels a cold hash without rebuilding its seed', async () => {
+    const pool = rx.createPoolSeedPool(light);
+    const seed = crypto.randomBytes(32);
+    const misses = rx.getStats().cacheMisses;
+    const contexts = rx.getStats().activeContexts;
+    const hashing = pool.hashAsync(seed, input);
+    assert.strictEqual(pool.release(seed), false, 'cold seed must not claim a resident release');
+    await assert.rejects(hashing, (error) => {
+        assert.strictEqual(error.code, 'ERR_RANDOMX_SEED_RELEASED');
+        return /released while warming/.test(error.message);
+    });
+    assert.strictEqual(rx.getStats().cacheMisses - misses, 1, 'cancelled hash rebuilt its seed');
+    assert.strictEqual(rx.getStats().activeContexts, contexts, 'cancelled hash left a context resident');
+    assert.strictEqual(pool.size, 0);
+    pool.releaseAll();
+});
+
+test('new protection cancels a superseded pending seed build', async () => {
+    const pool = rx.createPoolSeedPool({ ...light, maxSeeds: 1 });
+    const superseded = crypto.randomBytes(32);
+    const current = crypto.randomBytes(32);
+    const misses = rx.getStats().cacheMisses;
+    const oldResult = pool.protectSeedAsync(superseded).then(
+        () => null,
+        (error) => error
+    );
+    const oldHashResult = pool.hashAsync(superseded, input).then(
+        () => null,
+        (error) => error
+    );
+    await pool.protectSeedAsync(current);
+    const oldError = await oldResult;
+    const oldHashError = await oldHashResult;
+    assert.strictEqual(oldError && oldError.code, 'ERR_RANDOMX_PROTECTION_SUPERSEDED');
+    assert.strictEqual(oldHashError && oldHashError.code, 'ERR_RANDOMX_SEED_RELEASED');
+    assert.strictEqual(rx.getStats().cacheMisses - misses, 2, 'cancelled hash rebuilt its seed');
+    assert.ok(!pool.has(superseded));
+    assert.ok(pool.has(current));
+    assert.strictEqual(pool.getSnapshot().protectedSeed, `${current.toString('hex').slice(0, 16)}…`);
+    pool.releaseAll();
+});
+
+test('superseding protection preserves hashes for the previous seed when capacity allows', async () => {
+    const pool = rx.createPoolSeedPool({ ...light, maxSeeds: 2 });
+    const previous = crypto.randomBytes(32);
+    const current = crypto.randomBytes(32);
+    const oldProtection = pool.protectSeedAsync(previous).then(
+        () => null,
+        (error) => error
+    );
+    const previousHash = pool.hashAsync(previous, input);
+
+    await pool.protectSeedAsync(current);
+    const oldError = await oldProtection;
+    const hash = await previousHash;
+    assert.strictEqual(oldError && oldError.code, 'ERR_RANDOMX_PROTECTION_SUPERSEDED');
+    assert.ok(Buffer.isBuffer(hash), 'valid previous-seed hash was rejected during transition');
+    assert.ok(pool.has(previous));
+    assert.ok(pool.has(current));
+    assert.strictEqual(pool.getSnapshot().protectedSeed, `${current.toString('hex').slice(0, 16)}…`);
+    pool.releaseAll();
+});
+
+test('superseding resident protection rejects the older promise clearly', async () => {
+    const pool = rx.createPoolSeedPool({ ...light, maxSeeds: 2 });
+    const previous = crypto.randomBytes(32);
+    const current = crypto.randomBytes(32);
+    await pool.warmSeedAsync(previous);
+    const oldResult = pool.protectSeedAsync(previous).then(
+        () => null,
+        (error) => error
+    );
+    await pool.protectSeedAsync(current);
+    const oldError = await oldResult;
+    assert.strictEqual(oldError && oldError.code, 'ERR_RANDOMX_PROTECTION_SUPERSEDED');
+    assert.ok(pool.has(previous));
+    assert.ok(pool.has(current));
+    assert.strictEqual(pool.getSnapshot().protectedSeed, `${current.toString('hex').slice(0, 16)}…`);
+    assert.strictEqual(pool.getSnapshot().idleProtectedSeed, `${current.toString('hex').slice(0, 16)}…`);
+    pool.releaseAll();
 });
 
 test('concurrent warmups of one seed build it once', async () => {
@@ -183,8 +356,10 @@ test('buffer and hex arguments are validated', () => {
     const pool = rx.createPoolSeedPool(light);
     for (const bad of ['ab'.repeat(31), 'zz'.repeat(32), 42]) {
         assert.throws(() => pool.hashAsyncFromHex(bad, input), /seedHex/, `seedHex ${bad}`);
+        assert.throws(() => pool.protectSeedAsyncFromHex(bad), /seedHex/, `protected seedHex ${bad}`);
     }
     assert.throws(() => pool.hashAsync(Buffer.alloc(31), input), /32-byte/);
+    assert.throws(() => pool.protectSeed(Buffer.alloc(31)), /32-byte/);
     pool.releaseAll();
 });
 

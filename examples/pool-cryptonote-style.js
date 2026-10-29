@@ -7,11 +7,12 @@
  *   3. Build the block blob miners hash (cryptonote-util / pool-specific helpers).
  *   4. Verify shares with the same blob + seed the miner used.
  *
- * P2pool keeps two RandomX key slots (current + previous epoch). We mirror that with
- * `createPoolSeedPool` — default `maxSeeds: 2` (current + previous seed_hash).
- * If you drop old jobs immediately on template change, use `maxSeeds: 1` to halve peak memory,
- * or keep `maxSeeds: 2` and set `idleEvictMs` (e.g. 60_000) so the previous-seed VM is released
- * after a short grace period when nothing touches it (pools rarely resend old seed_hash).
+ * P2pool keeps current and previous RandomX key slots. With `maxSeeds: 2`, protect the current
+ * seed explicitly and use the other slot for previous work or a prewarmed next seed. On daemon
+ * template updates call `protectSeedAsync(currentSeed)` and, when available,
+ * `warmSeedAsync(nextSeed)`. Do not infer current-seed identity from whichever share arrived last.
+ * `idleEvictMs` can then release older used contexts after a grace period. If old jobs are dropped
+ * immediately, `maxSeeds: 1` lowers peak memory instead.
  *
  * This file does not depend on cryptonote-util; it shows where RandomX fits.
  * Replace `buildPlaceholderBlob()` with your pool's blob conversion + nonce injection.
@@ -23,12 +24,13 @@ const randomx = require('../index');
 /**
  * @param {object} opts
  * @param {boolean} [opts.fast=true] Use fast mode (~2GB per context) for ~1–2ms hashes.
- * @param {number} [opts.idleEvictMs] Release a seed’s context after this many ms without a get/hash (saves RAM vs holding two fast VMs forever).
+ * @param {number} [opts.idleEvictMs] Release older used, unprotected seed contexts after this
+ *   many ms without use; current and never-used prewarmed seeds are retained (subject to maxSeeds).
  */
 function createPoolVerifier(opts = {}) {
     const fast = opts.fast !== false;
     return randomx.createPoolSeedPool({
-        // 2 = current + previous seed_hash; 1 = less RAM if you never verify old jobs
+        // 2 = protected current + one adjacent transition seed; 1 = less RAM if no old jobs remain
         maxSeeds: opts.maxSeeds != null ? opts.maxSeeds : 2,
         mode: fast ? 'fast' : 'light',
         threads: opts.threads != null ? opts.threads : Math.max(1, os.cpus().length),
@@ -47,10 +49,11 @@ function createPoolVerifier(opts = {}) {
  * rx/0 after the switch. For rx/2 the value compared with the target is the commitment (`pow`),
  * which xmrig submits as `result` (its `commitment` field carries the raw hash).
  *
- * **When `seedHashHex` changes:** the seed pool looks it up in its LRU.
+ * **When `seedHashHex` changes:** the seed pool looks it up in its LRU. Separately, the pool's
+ * template-update handler must call `protectSeedAsync()` for the daemon's current seed.
  * - First time this seed is seen → built once on the worker pool (dataset init in fast mode).
- * - Seed still cached (current + previous with `maxSeeds: 2`) → same resources, no re-init.
- * - New seed and cache full → evicts the least recently used seed.
+ * - Seed still cached (current + adjacent previous/next with `maxSeeds: 2`) → same resources, no re-init.
+ * - New seed and cache full → evicts the least recently used unprotected seed when possible.
  *
  * @param {import('../index').SeedPool} cache
  * @param {string} seedHashHex — from block template: `blockTemplate.seed_hash`
@@ -112,6 +115,7 @@ function buildPlaceholderBlob() {
 async function demo() {
     const cache = createPoolVerifier({ fast: true });
     const seedHashHex = 'ab'.repeat(32);
+    await cache.protectSeedAsync(Buffer.from(seedHashHex, 'hex'));
 
     for (const majorVersion of [16, 17]) {
         const blob = buildPlaceholderBlob();

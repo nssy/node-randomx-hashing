@@ -496,6 +496,8 @@ std::shared_ptr<RandomXSeedResources> ContextManager::acquireSeedResources(const
 
 /**
  * Allocate and initialize the cache (and in fast mode the dataset) for one seed.
+ * Fast mode allocates its long-lived dataset before the temporary cache so a constrained
+ * reserved huge-page pool benefits hashing rather than dataset initialization.
  * Each buffer records which memory backing it got.
  */
 std::shared_ptr<RandomXSeedResources> ContextManager::createSeedResources(const std::string& seed, const RandomXConfig& config) {
@@ -507,6 +509,16 @@ std::shared_ptr<RandomXSeedResources> ContextManager::createSeedResources(const 
     const bool fast = config.mode == RandomXMode::FAST;
     resources->vmFlags = fast ? static_cast<randomx_flags>(flags | RANDOMX_FLAG_FULL_MEM) : flags;
 
+    const unsigned long itemCount = fast ? randomx_dataset_item_count() : 0;
+    if (fast) {
+        resources->dataset = allocWithBacking<randomx_dataset>(
+            flags, config.hugePages, static_cast<size_t>(itemCount) * RANDOMX_DATASET_ITEM_SIZE,
+            randomx_alloc_dataset, randomx_get_dataset_memory, resources->datasetBacking);
+        if (!resources->dataset) {
+            return nullptr;
+        }
+    }
+
     resources->cache = allocWithBacking<randomx_cache>(
         flags, config.hugePages, kCacheBytes,
         randomx_alloc_cache, randomx_get_cache_memory, resources->cacheBacking);
@@ -517,14 +529,6 @@ std::shared_ptr<RandomXSeedResources> ContextManager::createSeedResources(const 
 
     if (!fast) {
         return resources;
-    }
-
-    const unsigned long itemCount = randomx_dataset_item_count();
-    resources->dataset = allocWithBacking<randomx_dataset>(
-        flags, config.hugePages, static_cast<size_t>(itemCount) * RANDOMX_DATASET_ITEM_SIZE,
-        randomx_alloc_dataset, randomx_get_dataset_memory, resources->datasetBacking);
-    if (!resources->dataset) {
-        return nullptr;
     }
 
     const uint32_t numThreads = std::max<uint32_t>(1, config.threads);

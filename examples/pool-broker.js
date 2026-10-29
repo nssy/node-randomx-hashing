@@ -12,13 +12,17 @@
  * `ok: true` plus a result, or `ok: false` plus `error`.
  *
  *   op       request fields               reply fields
- *   hello    -                            protocol, capabilities, mode
+ *   hello    -                            protocol, capabilities, features, mode
+ *   protect  seed                         memory      (warm and identify the current seed)
  *   warm     seed                         memory      (backing the seed got; see memory-backing.js)
  *   hash     seed, input, variant?        hash
  *   pow      seed, input, variant?        hash, pow   (pow = value compared with the target)
  *   stats    -                            stats, seeds (per seed: VMs per variant, memory backing)
  *
  * `variant` is 'rx/0' (default) or 'rx/2'; anything else is an error, never a fallback.
+ *
+ * `features` advertises additive broker operations such as `protect-seed`; do not infer them from
+ * the protocol number alone during a rolling upgrade.
  *
  * Rolling upgrades: a protocol 1 broker answers `hello` with "unsupported op" and **ignores**
  * `variant`, so it would return an rx/0 hash for an rx/2 request. The client therefore sends
@@ -85,7 +89,12 @@ function startBroker() {
     });
 
     const handlers = {
-        hello: () => ({ protocol: PROTOCOL, capabilities: randomx.capabilities(), mode }),
+        hello: () => ({ protocol: PROTOCOL, capabilities: randomx.capabilities(), features: ['protect-seed'], mode }),
+        protect: async (m) => {
+            const seed = asBuffer(m.seed);
+            await rxCache.protectSeedAsync(seed);
+            return { memory: rxCache.getMemoryInfo(seed) };
+        },
         warm: async (m) => {
             const seed = asBuffer(m.seed);
             await rxCache.warmSeedAsync(seed);
@@ -247,10 +256,13 @@ async function runClient() {
     try {
         const peer = await client.handshake();
         console.log(`Connected to ${SOCKET_PATH}: protocol ${peer.protocol}`, peer.capabilities);
+        if (!Array.isArray(peer.features) || !peer.features.includes('protect-seed')) {
+            throw new Error('broker peer does not advertise protect-seed');
+        }
 
         const seed = Buffer.alloc(32, 7);
-        const { memory } = await client.request('warm', { seed });
-        console.log('Seed ready:', memory);
+        const { memory } = await client.request('protect', { seed });
+        console.log('Current seed ready:', memory);
 
         const blobs = Array.from({ length: 12 }, (_, i) => Buffer.alloc(76, i));
         for (const variant of ['rx/0', 'rx/2']) {

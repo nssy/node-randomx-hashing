@@ -1,5 +1,36 @@
 # Changelog
 
+## 2.0.1 (2026-10-29)
+
+### Added
+- `SeedPool.protectSeed()` / `protectSeedAsync()` and hex forms explicitly identify the current
+  seed. `getSnapshot()` reports it and marks its resident entry.
+- The pool broker example adds a `protect` operation and advertises its `protect-seed` feature for
+  rolling-upgrade capability checks.
+
+### Fixed
+- Idle eviction retains the explicitly protected seed, or the latest used seed when no explicit
+  identity was supplied. Late work on a previous seed can no longer displace an explicitly
+  protected current seed.
+- Releasing or displacing the latest-used seed restores the next-most-recent resident seed as the
+  compatibility fallback, independent of warmup-only LRU touches.
+- LRU displacement prefers an unprotected seed while keeping `maxSeeds` as a hard memory bound,
+  so prewarming the next epoch does not evict a quiet current epoch.
+- A cold async hash cancelled during warmup no longer starts a second build and then rejects,
+  leaving an unused context resident.
+- Superseded async protection now rejects consistently with
+  `code === 'ERR_RANDOMX_PROTECTION_SUPERSEDED'`, including when the older seed was already warm.
+- Superseding protection no longer cancels a previous-seed build when the pool can retain both
+  seeds, so hashes already waiting for that build can complete.
+- Seed-pool snapshots identify the effective idle-retained seed, including the latest-used fallback
+  when there is no explicit protection.
+- Fast mode allocates its long-lived dataset before the temporary initialization cache, preserving
+  reserved huge pages for steady-state hashing when the pool cannot back both buffers.
+
+### Documentation
+- Pool deployment guidance now calls out native-hash admission control: queue work above
+  `vmPoolSize` before the addon so libuv workers remain available for seed warmup.
+
 ## 2.0.0 (2026-10-28)
 
 ### RandomX

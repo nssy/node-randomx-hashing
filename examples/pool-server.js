@@ -8,6 +8,8 @@
  * - The variant comes from the job (`getVariant`), never from a global setting, so jobs
  *   issued before a fork keep verifying as rx/0 afterwards.
  * - Memory backing is logged per seed once it is built.
+ * - This demo uses one generated seed. A live pool should call `protectSeedAsync(currentSeed)` on
+ *   daemon template updates; do not infer current-seed identity from whichever share arrives.
  */
 
 'use strict';

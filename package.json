@@ -1,6 +1,6 @@
 {
     "name": "randomx-hashing",
-    "version": "2.0.0",
+    "version": "2.0.1",
     "description": "High-performance RandomX share verifier for Node.js mining pools",
     "main": "index.js",
     "files": [

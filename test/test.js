@@ -205,7 +205,7 @@ async function runTests() {
         epoch.releaseAll();
         console.log('✓ Context cache test passed\n');
 
-        // Test 10b: Idle eviction — drop unused seed contexts after a grace period (saves RAM in pools)
+        // Test 10b: Idle eviction — release older idle seed contexts after a grace period.
         console.log('Test 10b: Context cache idle eviction');
         const idleRx = randomx.createContextCache({
             maxSeeds: 2,
@@ -221,9 +221,12 @@ async function runTests() {
         assert(idleRx.size === 2);
         assert(idleRx.getSnapshot().idleEvictMs === 50);
         await new Promise((resolve) => setTimeout(resolve, 80));
+        assert(!idleRx.has(is1), 'older idle context should be released');
+        assert(idleRx.has(is2), 'latest used context should stay warm');
+        assert(idleRx.size === 1);
         const idleId1b = idleRx.getContext(is1);
         assert(idleId1 !== idleId1b, 'idle eviction should release and recreate context');
-        assert(idleRx.size === 1);
+        assert(idleRx.size === 2);
         idleRx.releaseAll();
         console.log('✓ Context cache idle eviction passed\n');
 
